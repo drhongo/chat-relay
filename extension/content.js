@@ -254,18 +254,13 @@ async function handleIncomingChatMessage(messageContent, message) {
       // Initiate capture BEFORE sending the message to avoid race conditions
       if (provider.initiateResponseCapture) {
           console.log(CS_LOG_PREFIX, `Calling provider.initiateResponseCapture for requestId: ${requestId}`);
-          provider.initiateResponseCapture(requestId, handleProviderResponse);
+          await provider.initiateResponseCapture(requestId, handleProviderResponse);
       }
       const success = await provider.sendChatMessage(messageContent, message);
       if (success) {
           console.log(CS_LOG_PREFIX, `Message sent successfully for requestId: ${requestId}`);
-          
-          if (provider.initiateResponseCapture) {
-              console.log(CS_LOG_PREFIX, `Provider has custom capture logic. Initiating...`);
-              provider.initiateResponseCapture(requestId, (id, text, isFinal) => {
-                  handleProviderResponse(id, text, isFinal);
-              });
-          } else if (provider.captureMethod !== "debugger") {
+
+          if (provider.captureMethod !== "debugger" && !provider.initiateResponseCapture) {
               console.log(CS_LOG_PREFIX, `Provider uses ${provider.captureMethod} capture. Starting monitorResponseCompletion.`);
               startMonitoringForResponse();
           }

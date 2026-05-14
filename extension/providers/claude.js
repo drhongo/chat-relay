@@ -277,10 +277,25 @@ class ClaudeProvider {
     }
   }
 
-  initiateResponseCapture(requestId, responseCallback) {
+  async initiateResponseCapture(requestId, responseCallback) {
     console.log(`[${this.name}] initiateResponseCapture called for requestId: ${requestId}. CURRENT CAPTURE METHOD IS: ${this.captureMethod}`);
     if (this.captureMethod === "debugger") {
       this.pendingResponseCallbacks.set(requestId, responseCallback);
+
+      const patterns = this.getStreamingApiPatterns();
+      if (patterns.length > 0) {
+        await new Promise(resolve => {
+            chrome.runtime.sendMessage({
+                type: "SET_DEBUGGER_TARGETS",
+                providerName: this.name,
+                patterns: patterns
+            }, response => {
+                console.log(`[${this.name}] SET_DEBUGGER_TARGETS response:`, response);
+                resolve();
+            });
+        });
+      }
+
       console.log(`[${this.name}] Stored callback for debugger response, requestId: ${requestId}`);
     } else if (this.captureMethod === "dom") {
       console.log(`[${this.name}] Starting DOM monitoring for requestId: ${requestId}`);

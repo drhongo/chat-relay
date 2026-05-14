@@ -294,13 +294,18 @@ chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
 
   if (type === "SET_DEBUGGER_TARGETS") {
     if (sender.tab && sender.tab.id) {
-      attachDebuggerAndEnableFetch(sender.tab.id, message.providerName, message.patterns);
-      sendResponse({ status: "Debugger attachment initiated" });
+      attachDebuggerAndEnableFetch(sender.tab.id, message.providerName, message.patterns)
+        .then(() => {
+          sendResponse({ status: "Debugger attachment and Fetch.enable successful" });
+        })
+        .catch(err => {
+          sendResponse({ status: "Debugger attachment failed", error: err.message });
+        });
     } else {
       sendResponse({ status: "Error: Missing tabId" });
     }
-    return true;
-  } 
+    return true; // Keep message channel open for async response
+  }
   
   if (type === "LOG_MESSAGE") {
     sendRemoteLog(message.level, message.message, message.requestId);
@@ -407,20 +412,21 @@ async function attachDebuggerAndEnableFetch(tabId, providerName, patterns) {
             console.log(`[BG DEBUGGER] Already attached to tab ${tabId}.`);
         }
         
-        console.log(`[BG DEBUGGER] Enabling Fetch.enable for tab ${tabId} with patterns...`);
+        console.log(`[BG DEBUGGER] Enabling Fetch and Network for tab ${tabId} with patterns...`);
         await new Promise((resolve, reject) => {
-            // CRITICAL: We MUST specify requestStage: "Response" to catch the body and status code!
-            chrome.debugger.sendCommand(debuggee, "Fetch.enable", { 
-                patterns: patterns.map(p => ({ urlPattern: p.urlPattern, requestStage: "Response" })) 
-            }, () => {
-                if (chrome.runtime.lastError) {
-                    console.error(`[BG DEBUGGER] Fetch.enable failed for tab ${tabId}:`, chrome.runtime.lastError.message);
-                    return reject(chrome.runtime.lastError);
-                }
-                console.log(`[BG DEBUGGER] Fetch.enable SUCCESS for tab ${tabId}.`);
-                const currentTabData = debuggerAttachedTabs.get(tabId);
-                if (currentTabData) currentTabData.isFetchEnabled = true;
-                resolve();
+            chrome.debugger.sendCommand(debuggee, "Network.enable", {}, () => {
+                chrome.debugger.sendCommand(debuggee, "Fetch.enable", {
+                    patterns: patterns.map(p => ({ urlPattern: p.urlPattern, requestStage: "Response" }))
+                }, () => {
+                    if (chrome.runtime.lastError) {
+                        console.error(`[BG DEBUGGER] Enable failed for tab ${tabId}:`, chrome.runtime.lastError.message);
+                        return reject(chrome.runtime.lastError);
+                    }
+                    console.log(`[BG DEBUGGER] Debugger domains enabled SUCCESS for tab ${tabId}.`);
+                    const currentTabData = debuggerAttachedTabs.get(tabId);
+                    if (currentTabData) currentTabData.isFetchEnabled = true;
+                    resolve();
+                });
             });
         });
     } catch (e) {
@@ -448,49 +454,81 @@ chrome.debugger.onDetach.addListener((source) => {
 });
 
 chrome.debugger.onEvent.addListener((debuggeeId, message, params) => {
-    if (!debuggeeId.tabId || message !== "Fetch.requestPaused") return;
     const tabId = debuggeeId.tabId;
+    if (!tabId) return;
     const tabInfo = debuggerAttachedTabs.get(tabId);
-    
+
     // Fallback to global lastRequestId if tab-specific one isn't set yet
-    const currentOperationRequestId = (tabInfo && tabInfo.lastKnownRequestId !== null) 
-        ? tabInfo.lastKnownRequestId 
+    const currentOperationRequestId = (tabInfo && tabInfo.lastKnownRequestId !== null)
+        ? tabInfo.lastKnownRequestId
         : lastRequestId;
 
-    if (!tabInfo || !tabInfo.isFetchEnabled || currentOperationRequestId === null) {
-        chrome.debugger.sendCommand(debuggeeId, "Fetch.continueRequest", { requestId: params.requestId });
-        return;
-    }
-    const matchesPattern = tabInfo.patterns.some(p => {
-        const patternRegex = new RegExp(String(p.urlPattern).replace(/[.*+?^${}()|[\]\\]/g, '\\$&').replace(/\\\*/g, '.*?'));
-        return patternRegex.test(params.request.url);
-    });
+    if (message === "Fetch.requestPaused") {
+        console.log(`[BG DEBUGGER] Request paused in tab ${tabId}: ${params.request.url} (Status: ${params.responseStatusCode || 'N/A'})`);
 
-    if (!matchesPattern) {
+        if (!tabInfo || !tabInfo.isFetchEnabled || currentOperationRequestId === null) {
+            chrome.debugger.sendCommand(debuggeeId, "Fetch.continueRequest", { requestId: params.requestId });
+            return;
+        }
+
+        const matchesPattern = tabInfo.patterns.some(p => {
+            const patternRegex = new RegExp(String(p.urlPattern).replace(/[.*+?^${}()|[\]\\]/g, '\\$&').replace(/\\\*/g, '.*?'));
+            return patternRegex.test(params.request.url);
+        });
+
+        if (!matchesPattern) {
+            chrome.debugger.sendCommand(debuggeeId, "Fetch.continueRequest", { requestId: params.requestId });
+            return;
+        }
+
+        console.log(`[BG DEBUGGER] Matching request found: ${params.request.url}. Continuing immediately to avoid blocking stream.`);
+        // Continue immediately so the UI remains responsive and streaming works
         chrome.debugger.sendCommand(debuggeeId, "Fetch.continueRequest", { requestId: params.requestId });
-        return;
+
+        // We will capture the data via Network.loadingFinished or Network.eventSourceMessageReceived
     }
 
-    if (params.responseStatusCode && params.responseStatusCode >= 200 && params.responseStatusCode < 300) {
-        chrome.debugger.sendCommand(debuggeeId, "Fetch.getResponseBody", { requestId: params.requestId }, (responseBodyData) => {
+    if (message === "Network.eventSourceMessageReceived") {
+        console.log(`[BG DEBUGGER] SSE Message in tab ${tabId} for request ${params.requestId}`);
+        // This gives us real-time chunks for SSE!
+        chrome.tabs.sendMessage(tabId, {
+            type: "PROVIDER_DEBUGGER_EVENT",
+            detail: {
+                requestId: currentOperationRequestId,
+                networkRequestId: params.requestId,
+                data: `data: ${params.data}\n\n`, // Re-wrap in data: prefix for the provider's parser
+                isFinal: false
+            }
+        });
+    }
+
+    if (message === "Network.loadingFinished") {
+        if (!tabInfo || currentOperationRequestId === null) return;
+
+        // When the request finishes, we can get the clean, full body as a final check
+        chrome.debugger.sendCommand(debuggeeId, "Network.getResponseBody", { requestId: params.requestId }, (response) => {
+            if (chrome.runtime.lastError) return;
+
             let processedData = null;
-            if (responseBodyData && responseBodyData.body) {
-                if (responseBodyData.base64Encoded) {
+            if (response && response.body) {
+                console.log(`[BG DEBUGGER] Final body captured for request ${params.requestId}, length: ${response.body.length}`);
+                if (response.base64Encoded) {
                     try {
-                        processedData = new TextDecoder('utf-8').decode(Uint8Array.from(atob(responseBodyData.body), c => c.charCodeAt(0)));
-                    } catch (e) { processedData = responseBodyData.body; }
+                        processedData = new TextDecoder('utf-8').decode(Uint8Array.from(atob(response.body), c => c.charCodeAt(0)));
+                    } catch (e) {
+                        processedData = response.body;
+                    }
                 } else {
-                    processedData = responseBodyData.body;
+                    processedData = response.body;
                 }
             }
-            chrome.tabs.sendMessage(tabId, {
-                type: "PROVIDER_DEBUGGER_EVENT",
-                detail: { requestId: currentOperationRequestId, networkRequestId: params.requestId, data: processedData, isFinal: true }
-            });
-            // CRITICAL: Continue the request so the page can actually receive it!
-            chrome.debugger.sendCommand(debuggeeId, "Fetch.continueRequest", { requestId: params.requestId });
+
+            if (processedData) {
+                chrome.tabs.sendMessage(tabId, {
+                    type: "PROVIDER_DEBUGGER_EVENT",
+                    detail: { requestId: currentOperationRequestId, networkRequestId: params.requestId, data: processedData, isFinal: true }
+                });
+            }
         });
-    } else {
-        chrome.debugger.sendCommand(debuggeeId, "Fetch.continueRequest", { requestId: params.requestId });
     }
 });

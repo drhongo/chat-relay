@@ -275,13 +275,13 @@ class GeminiProvider {
     return !result.isStillGenerating;
   }
 
-  initiateResponseCapture(requestId, responseCallback) {
+  async initiateResponseCapture(requestId, responseCallback) {
     console.log(`[${this.name}] initiateResponseCapture called for requestId: ${requestId}`);
     this.pendingResponseCallbacks.set(requestId, responseCallback);
     this._startDOMMonitoring(requestId);
   }
 
-  handleDebuggerData(requestId, rawData, isFinalFromBackground) {
+  async handleDebuggerData(requestId, rawData, isFinalFromBackground) {
     // Standard interface but Gemini uses DOM capture primarily now
     this._startDOMMonitoring(requestId);
   }

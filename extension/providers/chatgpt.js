@@ -37,7 +37,7 @@ class ChatGptProvider {
     this.pendingResponseCallbacks = new Map();
     this.requestAccumulators = new Map();
     this.domMonitorTimer = null;
-    this.domFallbackTimeout = 8000; // Increased to 8s to allow for UI delays
+    this.domFallbackTimeout = 15000; // Increased to 15s to allow for slow LLM starts and debugger lag
     this.domFallbackTimer = null;
 
     this._loadSettings();
@@ -205,13 +205,13 @@ class ChatGptProvider {
       }
   }
 
-  initiateResponseCapture(requestId, responseCallback) {
+  async initiateResponseCapture(requestId, responseCallback) {
     console.log(`[${this.name}] initiateResponseCapture called for requestId: ${requestId}. Capture method: ${this.captureMethod}`);
     this.pendingResponseCallbacks.set(requestId, responseCallback);
-    
+
     // Reset accumulator for this request
     this.requestAccumulators.set(requestId, { text: "", isDefinitelyFinal: false, currentProcessingStage: undefined });
-    
+
     if (this.captureMethod === "debugger") {
       console.log(`[${this.name}] Debugger capture initiated. Requesting debugger attachment.`);
 
@@ -221,11 +221,17 @@ class ChatGptProvider {
           patterns.push({ urlPattern: this.debuggerUrlPattern });
       }
 
-      chrome.runtime.sendMessage({
-          type: "SET_DEBUGGER_TARGETS",
-          providerName: this.name,
-          patterns: patterns
+      await new Promise(resolve => {
+        chrome.runtime.sendMessage({
+            type: "SET_DEBUGGER_TARGETS",
+            providerName: this.name,
+            patterns: patterns
+        }, response => {
+            console.log(`[${this.name}] SET_DEBUGGER_TARGETS response:`, response);
+            resolve();
+        });
       });
+
       console.log(`[${this.name}] Debugger capture initiated with ${patterns.length} patterns. Setting DOM fallback timer for ${this.domFallbackTimeout}ms.`);
       
       // Clear any existing fallback timer
@@ -285,6 +291,13 @@ class ChatGptProvider {
         // Ignore
       } else {
           const parseOutput = this.parseDebuggerResponse(rawData, accumulator.currentProcessingStage);
+          if (accumulator.text.length === 0 && (parseOutput.text || parseOutput.operation === "replace")) {
+            console.log(`[${this.name}] SUCCESS: First debugger data received for ${requestId}. Disabling DOM fallback timer.`);
+            if (this.domFallbackTimer) {
+                clearTimeout(this.domFallbackTimer);
+                this.domFallbackTimer = null;
+            }
+          }
           accumulator.currentProcessingStage = parseOutput.newProcessingStage; // Update stage
           console.log(`[${this.name}] handleDebuggerData - requestId: ${requestId}, parseOutput: ${JSON.stringify(parseOutput)}`);
           
@@ -798,8 +811,9 @@ class ChatGptProvider {
   getStreamingApiPatterns() {
     if (this.captureMethod === "debugger") {
       return [
-        { urlPattern: "*chatgpt.com/backend-api/conversation*", requestStage: "Response" },
-        { urlPattern: "*chatgpt.com/backend-api/f/conversation*", requestStage: "Response" }
+        { urlPattern: "*://chatgpt.com/backend-api/conversation*", requestStage: "Response" },
+        { urlPattern: "*://chatgpt.com/backend-api/f/conversation*", requestStage: "Response" },
+        { urlPattern: "*://chat.openai.com/backend-api/conversation*", requestStage: "Response" }
       ];
     }
     // For websocket method, we don't need to return any patterns as we are not using the debugger.
