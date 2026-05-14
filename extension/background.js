@@ -19,7 +19,7 @@
 
 // Default settings
 const DEFAULT_SETTINGS = {
-  serverHost: 'localhost',
+  serverHost: '127.0.0.1',
   serverPort: 3003,
   serverProtocol: 'ws'
 };
@@ -29,927 +29,401 @@ let reconnectInterval = 5000;
 let reconnectTimer = null;
 let activeTabId = null;
 let serverUrl = '';
-let lastRequestId = null; // User's global lastRequestId
-let processingRequest = false; // User's global processing flag
-let pendingRequests = []; // User's command queue
-let lastSuccessfullyProcessedMessageText = null; // Text of the last message successfully processed (AI response or duplicate handled)
-const pendingRequestDetails = new Map(); // Stores { text: string } for active requests, keyed by requestId
+let lastRequestId = null; 
+let processingRequest = false; 
+let pendingRequests = []; 
+let lastSuccessfullyProcessedMessageText = null; 
+const pendingRequestDetails = new Map(); 
 
 // Supported domains for chat interfaces
 const supportedDomains = ['gemini.google.com', 'aistudio.google.com', 'chatgpt.com', 'claude.ai'];
 
 // ===== DEBUGGER RELATED GLOBALS =====
 const BG_LOG_PREFIX = '[BG DEBUGGER]';
-let debuggerAttachedTabs = new Map(); // tabId -> { providerName, patterns, isFetchEnabled, isAttached, lastKnownRequestId }
+let debuggerAttachedTabs = new Map(); 
+let heartbeatTimer = null;
+
+// Keep-alive for Manifest V3 service worker
+chrome.alarms.create('keepAlive', { periodInMinutes: 0.5 });
+chrome.alarms.onAlarm.addListener((alarm) => {
+  if (alarm.name === 'keepAlive') {
+    if (relaySocket && relaySocket.readyState === WebSocket.OPEN) {
+        relaySocket.send(JSON.stringify({ type: 'PING' }));
+    }
+  }
+});
+
+/**
+ * Sends a log message to the relay server for remote debugging.
+ */
+function sendRemoteLog(level, message, requestId = null) {
+    if (relaySocket && relaySocket.readyState === WebSocket.OPEN) {
+        relaySocket.send(JSON.stringify({
+            type: 'LOG_MESSAGE',
+            level: level,
+            message: `[BACKGROUND] ${message}`,
+            requestId: requestId
+        }));
+    }
+    if (level === 'error') console.error(message);
+    else if (level === 'warn') console.warn(message);
+    else console.log(message);
+}
 
 
 // Load settings and connect to the relay server
 function loadSettingsAndConnect() {
-  console.log("BACKGROUND: Loading settings and connecting to relay server");
   chrome.storage.sync.get(DEFAULT_SETTINGS, (items) => {
     serverUrl = `${items.serverProtocol}://${items.serverHost}:${items.serverPort}`;
-    console.log("BACKGROUND: Using server URL:", serverUrl);
+    console.log("BACKGROUND: Connecting to relay server:", serverUrl);
     connectToRelayServer();
   });
 }
 
-// Connect to the relay server
+// Connect to the relay server via WebSocket
 function connectToRelayServer() {
-  if (relaySocket && relaySocket.readyState === WebSocket.OPEN) {
-    console.log("BACKGROUND: Relay WS: Already connected.");
-    return;
+  if (relaySocket) {
+    relaySocket.close();
   }
 
-  if (!navigator.onLine) {
-    console.warn("BACKGROUND: Network offline. Deferring connection attempt.");
-    if (reconnectTimer) clearTimeout(reconnectTimer);
-    reconnectTimer = setTimeout(connectToRelayServer, reconnectInterval);
-    return;
-  }
-
-  const healthCheckUrl = serverUrl.replace(/^ws/, 'http') + '/health';
-  console.log("BACKGROUND: Performing HTTP pre-check to", healthCheckUrl);
-
-  fetch(healthCheckUrl)
-    .then(response => {
-      if (!response.ok) {
-        // Server responded, but not with a 2xx status (e.g., 404, 500)
-        console.warn(`BACKGROUND: HTTP pre-check to ${healthCheckUrl} received non-OK status: ${response.status}. Server might be having issues. Deferring WebSocket attempt.`);
-        return Promise.reject(new Error(`Server responded with ${response.status}`));
-      }
-      return response.json(); // Attempt to parse JSON
-    })
-    .then(healthData => {
-      console.log(`BACKGROUND: HTTP pre-check to ${healthCheckUrl} successful. Server status: ${healthData.status}, Active Connections: ${healthData.activeBrowserConnections}. Proceeding with WebSocket connection.`);
-      attemptWebSocketConnection();
-    })
-    .catch(fetchError => {
-      // This catches network errors (server down) or errors from the .then() chain (non-OK response, JSON parse error)
-      console.warn(`BACKGROUND: HTTP pre-check to ${healthCheckUrl} failed: ${fetchError.message}. Server is likely down, unreachable, or health endpoint is misbehaving. Deferring WebSocket attempt.`);
-      relaySocket = null;
-      if (reconnectTimer) clearTimeout(reconnectTimer);
-      reconnectTimer = setTimeout(connectToRelayServer, reconnectInterval);
-    });
-}
-
-function attemptWebSocketConnection() {
-  console.log("BACKGROUND: Relay WS: Attempting to connect to", serverUrl);
   try {
     relaySocket = new WebSocket(serverUrl);
 
     relaySocket.onopen = () => {
-      console.log("BACKGROUND: Relay WS: Connection established with relay server.");
-      reconnectInterval = 5000; // Reset reconnect interval on successful connection
+      console.log("BACKGROUND: Relay WS: Connection established.");
+      reconnectInterval = 5000; 
       if (reconnectTimer) clearTimeout(reconnectTimer);
       reconnectTimer = null;
 
-      // Notify the server that this extension instance is ready
       if (relaySocket && relaySocket.readyState === WebSocket.OPEN) {
         const readyMessage = { type: 'EXTENSION_READY' };
         relaySocket.send(JSON.stringify(readyMessage));
-        console.log("BACKGROUND: Relay WS: Sent EXTENSION_READY to server.");
+        
+        if (heartbeatTimer) clearInterval(heartbeatTimer);
+        heartbeatTimer = setInterval(() => {
+          if (relaySocket && relaySocket.readyState === WebSocket.OPEN) {
+            relaySocket.send(JSON.stringify({ type: 'PING' }));
+          }
+        }, 30000);
       }
     };
 
     relaySocket.onmessage = (event) => {
-      console.log("BACKGROUND: Relay WS: Message received from relay server:", event.data);
       try {
         const command = JSON.parse(event.data);
         if (command.type === 'SEND_CHAT_MESSAGE') {
-          console.log("BACKGROUND: Received SEND_CHAT_MESSAGE command with requestId:", command.requestId);
-          
-          // Store details for this new request
-          pendingRequestDetails.set(command.requestId, { messageContent: command.message }); // Changed key 'text' to 'messageContent'
-          let messagePreview = "";
-          const messageValue = command.message;
-          if (typeof messageValue === 'string') {
-            messagePreview = `String: "${messageValue.substring(0, 50)}..."`;
-          } else if (messageValue instanceof ArrayBuffer) {
-            messagePreview = `ArrayBuffer data (size: ${messageValue.byteLength} bytes)`;
-          } else if (messageValue instanceof Blob) {
-            messagePreview = `Blob data (size: ${messageValue.size} bytes, type: ${messageValue.type})`;
-          } else if (messageValue && typeof messageValue === 'object' && messageValue !== null) {
-            messagePreview = `Object data (type: ${Object.prototype.toString.call(messageValue)})`;
-          } else {
-            messagePreview = `Data type: ${typeof messageValue}, Value: ${String(messageValue).substring(0,50)}`;
-          }
-          console.log(`BACKGROUND: Stored details for requestId: ${command.requestId}, message: ${messagePreview}`);
-
-          // Add to the queue
+          pendingRequestDetails.set(command.requestId, { messageContent: command.message });
           pendingRequests.push(command);
-          console.log(`BACKGROUND: Added command with requestId: ${command.requestId} to queue. Queue length: ${pendingRequests.length}`);
-          
-          // Attempt to process the next request in the queue
           processNextRequest();
         }
       } catch (error) {
-        console.error("BACKGROUND: Relay WS: Error processing message from relay server:", error);
+        console.error("BACKGROUND: Relay WS error:", error);
       }
     };
 
-    relaySocket.onerror = (errorEvent) => {
-      console.warn("BACKGROUND: Relay WS: WebSocket connection error (event):", errorEvent);
-      // onclose will typically follow and handle reconnection logic
-    };
-
     relaySocket.onclose = (closeEvent) => {
-      console.log(`BACKGROUND: Relay WS: Connection closed (event). Code: ${closeEvent.code}, Reason: '${closeEvent.reason || 'N/A'}', Cleanly: ${closeEvent.wasClean}. Will attempt reconnect (via connectToRelayServer) in ${reconnectInterval / 1000}s.`);
       relaySocket = null;
+      if (heartbeatTimer) clearInterval(heartbeatTimer);
+      heartbeatTimer = null;
       if (reconnectTimer) clearTimeout(reconnectTimer);
-      // Retry the entire connectToRelayServer process, which includes the HTTP pre-check
       reconnectTimer = setTimeout(connectToRelayServer, reconnectInterval);
     };
-  } catch (instantiationError) {
-    console.error("BACKGROUND: Relay WS: Error instantiating WebSocket:", instantiationError);
-    relaySocket = null;
-    if (reconnectTimer) clearTimeout(reconnectTimer);
-    console.log(`BACKGROUND: Relay WS: Instantiation failed. Will attempt reconnect (via connectToRelayServer) in ${reconnectInterval / 1000}s.`);
-    // Retry the entire connectToRelayServer process
+  } catch (err) {
     reconnectTimer = setTimeout(connectToRelayServer, reconnectInterval);
   }
 }
 
 // Forward commands to content script
-async function forwardCommandToContentScript(command) { // command will include original requestId
+async function forwardCommandToContentScript(command) {
   try {
-    console.log("BACKGROUND: Forwarding command to content script:", command);
     let targetTabIdForCommand = null;
     
     if (activeTabId) {
       try {
-        console.log(`BACKGROUND: Attempting to use stored activeTabId: ${activeTabId}`);
-        // Test send to ensure tab is still valid for this command before associating requestId
         await new Promise((resolve, reject) => {
-            chrome.tabs.sendMessage(activeTabId, { type: "PING_TAB" }, response => { // Ping before associating
+            chrome.tabs.sendMessage(activeTabId, { type: "PING_TAB" }, response => {
                 if (chrome.runtime.lastError || !response || !response.success) {
-                    console.warn(`BACKGROUND: Ping to stored tab ${activeTabId} failed or no ack:`, chrome.runtime.lastError ? chrome.runtime.lastError.message : "No response/success false");
-                    activeTabId = null; // Invalidate activeTabId
+                    activeTabId = null;
                     reject(new Error("Ping failed"));
                 } else {
-                    console.log(`BACKGROUND: Ping to stored tab ${activeTabId} successful.`);
                     targetTabIdForCommand = activeTabId;
                     resolve();
                 }
             });
         });
       } catch (error) {
-        // Fall through to findAndSendToSuitableTab if ping fails
-        console.warn(`BACKGROUND: Error using stored activeTabId ${activeTabId}, will find new tab:`, error);
+        activeTabId = null;
       }
     }
     
     if (!targetTabIdForCommand) {
-        targetTabIdForCommand = await findAndSendToSuitableTab(command, true); // Pass true to only find, not send yet
+        targetTabIdForCommand = await findAndSendToSuitableTab(command, true);
     }
 
     if (targetTabIdForCommand) {
         const tabInfo = debuggerAttachedTabs.get(targetTabIdForCommand);
         if (tabInfo) {
-            tabInfo.lastKnownRequestId = command.requestId; // Store command's requestId for this specific tab
-            console.log(BG_LOG_PREFIX, `Associated requestId ${command.requestId} with tab ${targetTabIdForCommand} for debugger.`);
-        } else {
-            console.warn(BG_LOG_PREFIX, `Tab ${targetTabIdForCommand} is not being debugged. Cannot associate requestId for debugger.`);
+            tabInfo.lastKnownRequestId = command.requestId;
         }
 
-        // Now actually send the command
         const MAX_SEND_RETRIES = 3;
         const SEND_RETRY_DELAY = 500;
         let sendAttempt = 0;
 
-        function sendMessageWithRetry() {
+        const sendMessageWithRetry = () => {
           if (sendAttempt >= MAX_SEND_RETRIES) {
-            const errorMessage = `Failed to send message to content script in tab ${targetTabIdForCommand} after ${MAX_SEND_RETRIES} attempts.`;
-            console.error(`BACKGROUND: ${errorMessage}`);
+            const errorMessage = `Failed to send to tab ${targetTabIdForCommand} after ${MAX_SEND_RETRIES} attempts.`;
             if (relaySocket && relaySocket.readyState === WebSocket.OPEN) {
-              relaySocket.send(JSON.stringify({
-                type: "CHAT_RESPONSE_ERROR",
-                requestId: command.requestId,
-                error: errorMessage
-              }));
+              relaySocket.send(JSON.stringify({ type: "CHAT_RESPONSE_ERROR", requestId: command.requestId, error: errorMessage }));
             }
-            if (lastRequestId === command.requestId) {
-              processingRequest = false;
-            }
+            processingRequest = false;
             processNextRequest();
             return;
           }
 
           sendAttempt++;
-          chrome.tabs.sendMessage(targetTabIdForCommand, command, (response) => {
+          chrome.tabs.sendMessage(targetTabIdForCommand, command, async (response) => {
             if (chrome.runtime.lastError) {
-              console.warn(`BACKGROUND: Attempt ${sendAttempt} to send message to tab ${targetTabIdForCommand} failed: ${chrome.runtime.lastError.message}. Retrying in ${SEND_RETRY_DELAY}ms...`);
+              const lastErr = chrome.runtime.lastError.message;
+              if (lastErr.includes("Receiving end does not exist") || lastErr.includes("context invalidated")) {
+                console.warn(`[BG RELAY] Context invalidated for tab ${targetTabIdForCommand}. Attempting re-injection...`);
+                try {
+                  const tab = await chrome.tabs.get(targetTabIdForCommand);
+                  const providerFile = isUrlSupportedByProvider(tab.url, "ChatGptProvider") ? "providers/chatgpt.js" :
+                                      isUrlSupportedByProvider(tab.url, "GeminiProvider") ? "providers/gemini.js" :
+                                      isUrlSupportedByProvider(tab.url, "ClaudeProvider") ? "providers/claude.js" : null;
+
+                  if (providerFile) {
+                    await chrome.scripting.executeScript({
+                      target: { tabId: targetTabIdForCommand },
+                      files: ["providers/provider-utils.js", providerFile, "content.js"]
+                    });
+                    setTimeout(sendMessageWithRetry, 1000);
+                    return;
+                  }
+                } catch (e) {}
+              }
               setTimeout(sendMessageWithRetry, SEND_RETRY_DELAY);
-            } else {
-              console.log(`BACKGROUND: Content script in tab ${targetTabIdForCommand} acknowledged command on attempt ${sendAttempt}:`, response);
             }
           });
-        }
-
+        };
         sendMessageWithRetry();
-
-    } else {
-        const errorMsg = "Could not find any suitable tab for command.";
-        console.error(`BACKGROUND: ${errorMsg} for requestId: ${command.requestId}.`);
-        
-        if (relaySocket && relaySocket.readyState === WebSocket.OPEN) {
-            relaySocket.send(JSON.stringify({
-                type: "CHAT_RESPONSE_ERROR",
-                requestId: command.requestId,
-                error: errorMsg
-            }));
-            console.log(`BACKGROUND: Sent CHAT_RESPONSE_ERROR to server for requestId: ${command.requestId} (no suitable tab).`);
-        } else {
-            console.error(`BACKGROUND: Relay WS not OPEN, cannot send CHAT_RESPONSE_ERROR for requestId: ${command.requestId} (no suitable tab).`);
-        }
-
-        if (lastRequestId === command.requestId) {
-            processingRequest = false;
-            console.log(`BACKGROUND: Reset processingRequest for requestId: ${command.requestId} (no suitable tab).`);
-        }
-        // Ensure processNextRequest is called to handle any queued items,
-        // even if this one failed.
-        processNextRequest();
     }
-
   } catch (error) {
-    console.error("BACKGROUND: Error in forwardCommandToContentScript for requestId:", command.requestId, error);
-    // Send an error back to the server if an unexpected error occurs during forwarding
-    if (relaySocket && relaySocket.readyState === WebSocket.OPEN) {
-        relaySocket.send(JSON.stringify({
-            type: "CHAT_RESPONSE_ERROR",
-            requestId: command.requestId,
-            error: `Internal error in background script while forwarding command: ${error.message}`
-        }));
-        console.log(`BACKGROUND: Sent CHAT_RESPONSE_ERROR to server for requestId: ${command.requestId} (exception).`);
-    } else {
-        console.error(`BACKGROUND: Relay WS not OPEN, cannot send CHAT_RESPONSE_ERROR for requestId: ${command.requestId} (exception).`);
-    }
-
-    if (lastRequestId === command.requestId) {
-        processingRequest = false;
-        console.log(`BACKGROUND: Reset processingRequest for requestId: ${command.requestId} (exception).`);
-    }
+    processingRequest = false;
+    processNextRequest();
   }
 }
 
-// Helper function to find a suitable tab and send the command
+// Helper to find suitable tab
 async function findAndSendToSuitableTab(command, justFinding = false) {
   try {
-    console.log("BACKGROUND: Finding suitable tab for command:", command);
-    const allTabs = await chrome.tabs.query({});
-    const matchingTabs = allTabs.filter(tab => {
+    const tabs = await chrome.tabs.query({});
+    const modelLower = (command.model || "").toLowerCase();
+    const providerType = modelLower.includes('gpt') ? 'chatgpt' :
+                         modelLower.includes('gemini') ? 'gemini' :
+                         modelLower.includes('claude') ? 'claude' : null;
+
+    const matchingTabs = tabs.filter(tab => {
       if (!tab.url) return false;
+      if (providerType === 'chatgpt') return tab.url.includes('chatgpt.com') || tab.url.includes('openai.com');
+      if (providerType === 'gemini') return tab.url.includes('gemini.google.com') || tab.url.includes('aistudio.google.com');
+      if (providerType === 'claude') return tab.url.includes('claude.ai');
       return supportedDomains.some(domain => tab.url.includes(domain));
     });
     
-    console.log(`BACKGROUND: Found ${matchingTabs.length} tabs matching supported domains`);
-    
     if (matchingTabs.length > 0) {
-      const activeMatchingTabs = matchingTabs.filter(tab => tab.active);
-      const targetTab = activeMatchingTabs.length > 0 ? activeMatchingTabs[0] : matchingTabs[0];
-      console.log(`BACKGROUND: Selected tab ${targetTab.id} (${targetTab.url})`);
-      activeTabId = targetTab.id; // Update global activeTabId
-
-      if (justFinding) {
-          return targetTab.id;
-      }
+      // Sort by active, then by loaded status
+      const sorted = matchingTabs.sort((a, b) => {
+        if (a.active && !b.active) return -1;
+        if (!a.active && b.active) return 1;
+        if (a.status === 'complete' && b.status !== 'complete') return -1;
+        return 0;
+      });
       
-      console.warn("BACKGROUND: findAndSendToSuitableTab called with justFinding=false. Sending is now handled by caller.");
+      const targetTab = sorted[0];
+      console.log(`[BG RELAY] Routed ${command.model} to tab ${targetTab.id} (${targetTab.url})`);
       return targetTab.id; 
-
-    } else {
-      console.error("BACKGROUND: Could not find any tabs matching supported domains.");
-      return null;
     }
+    return null;
   } catch (error) {
-    console.error("BACKGROUND: Error finding suitable tab:", error);
     return null;
   }
 }
 
-// Process the next request in the queue
 function processNextRequest() {
-  console.log("BACKGROUND: Processing next request, queue length:", pendingRequests.length);
-  if (processingRequest && pendingRequests.length > 0) {
-      console.log("BACKGROUND: Still processing a request, deferring processNextRequest call.");
-      return; 
-  }
-  
+  if (processingRequest && pendingRequests.length > 0) return;
   if (pendingRequests.length > 0) {
     const nextCommand = pendingRequests.shift();
-    console.log("BACKGROUND: Processing next command from queue:", nextCommand);
-    
-    // Ensure details are stored if this came from the pendingRequests queue
-    // (though ideally they are stored when initially received from server)
-    if (!pendingRequestDetails.has(nextCommand.requestId) && nextCommand.message !== undefined) {
-        pendingRequestDetails.set(nextCommand.requestId, { messageContent: nextCommand.message }); // Use messageContent
-        let preview = typeof nextCommand.message === 'string' ? `"${nextCommand.message.substring(0,30)}..."` : `Type: ${typeof nextCommand.message}`;
-        console.log(`BACKGROUND: Stored details (messageContent) for queued requestId: ${nextCommand.requestId} (Message: ${preview}) while processing queue.`);
-    }
-
     processingRequest = true;
     lastRequestId = nextCommand.requestId;
-    
-    // Add a delay before forwarding the command
     setTimeout(() => {
         forwardCommandToContentScript({
           action: "SEND_CHAT_MESSAGE",
           requestId: nextCommand.requestId,
           messageContent: nextCommand.message,
           settings: nextCommand.settings,
-          lastProcessedText: lastSuccessfullyProcessedMessageText // Pass the text of the last successfully processed message
+          lastProcessedText: lastSuccessfullyProcessedMessageText
         });
-    }, 500); // 500ms delay
-  } else {
-    console.log("BACKGROUND: No pending requests to process.");
+    }, 500);
   }
 }
 
-// Helper function to check if a URL is supported by a given provider
-// This might need to be more sophisticated if provider domains are complex
 function isUrlSupportedByProvider(url, providerName) {
-    // This function would need access to the provider definitions or a shared config
-    // For AIStudioProvider:
-    if (providerName === "AIStudioProvider") {
-        return url.includes("aistudio.google.com");
-    }
-    // For GeminiProvider:
-    if (providerName === "GeminiProvider") {
-        return url.includes("gemini.google.com");
-    }
-    // For ChatGPTProvider:
-    if (providerName === "ChatGptProvider") { // Match the casing used by the provider's .name property
-        return url.includes("chatgpt.com");
-    }
-    // For ClaudeProvider:
-    if (providerName === "ClaudeProvider") { // Match the casing used by the provider's .name property
-        return url.includes("claude.ai");
-    }
-    // Add other providers if necessary
-    console.warn(BG_LOG_PREFIX, `isUrlSupportedByProvider: Unknown providerName '${providerName}'`);
+    if (!url) return false;
+    const lowerUrl = url.toLowerCase();
+    if (providerName === "AIStudioProvider") return lowerUrl.includes("aistudio.google.com");
+    if (providerName === "GeminiProvider") return lowerUrl.includes("gemini.google.com");
+    if (providerName === "ChatGptProvider") return lowerUrl.includes("chatgpt.com");
+    if (providerName === "ClaudeProvider") return lowerUrl.includes("claude.ai");
     return false;
 }
 
-// Listen for tab updates
-chrome.tabs.onUpdated.addListener(async (tabId, changeInfo, tab) => {
-  if (changeInfo.status === 'complete' && tab.url) {
-    const isSupportedDomain = supportedDomains.some(domain => tab.url.includes(domain));
-    if (isSupportedDomain) {
-      console.log(`BACKGROUND: A supported tab ${tabId} (${tab.url}) was updated. Checking if it should be the active tab.`);
-      // Potentially update activeTabId, but be careful if multiple supported tabs are open.
-      // The existing logic for activeTabId update via messages from content script might be more reliable.
-      // For now, let's ensure it's set if it's the *only* active one or becomes active.
-      if (tab.active || !activeTabId) {
-           // Check if this tab is actually one of the supported types before making it active
-           // This is a bit redundant with supportedDomains check but good for clarity
-           const currentProvider = providerUtils.getProviderForUrl(tab.url); // Assuming providerUtils is accessible or we have a similar utility
-           if (currentProvider) {
-                activeTabId = tabId;
-                console.log(`BACKGROUND: Set ${tabId} (${tab.url}) as the active tab.`);
-           }
-      }
-    }
-  }
-
-  // Handle debugger re-attachment on URL changes for already debugged tabs
-  const attachmentDetails = debuggerAttachedTabs.get(tabId);
-  if (attachmentDetails && attachmentDetails.isAttached && changeInfo.url && tab && tab.url) {
-    // changeInfo.url is the old URL, tab.url is the new one
-    console.log(BG_LOG_PREFIX, `Tab ${tabId} updated. Old URL: ${changeInfo.url}, New URL: ${tab.url}. Checking debugger status.`);
-
-    const providerStillValidForNewUrl = isUrlSupportedByProvider(tab.url, attachmentDetails.providerName);
-
-    if (providerStillValidForNewUrl) {
-      console.log(BG_LOG_PREFIX, `Tab ${tabId} URL changed to ${tab.url}. Provider ${attachmentDetails.providerName} still valid. Re-initiating debugger attachment.`);
-      const oldProviderName = attachmentDetails.providerName;
-      const oldPatterns = attachmentDetails.patterns; // These patterns were from the content script for the *domain*
-      
-      // Detach first to ensure a clean state, then re-attach.
-      // The 'isAttached' flag in attachmentDetails will be set to false by detachDebugger.
-      await detachDebugger(tabId);
-      
-      // Check if tab still exists (it should, as we are in its onUpdated event)
-      try {
-        const updatedTabInfo = await chrome.tabs.get(tabId);
-        if (updatedTabInfo) {
-            console.log(BG_LOG_PREFIX, `Proactively re-attaching debugger to ${tabId} (${updatedTabInfo.url}) with provider ${oldProviderName}.`);
-            // Content script should send SET_DEBUGGER_TARGETS on its re-initialization.
-            // However, a proactive re-attachment can be beneficial.
-            // The patterns might need to be re-fetched if they are URL-specific beyond the domain.
-            // For now, using oldPatterns, assuming they are domain-level.
-            await attachDebuggerAndEnableFetch(tabId, oldProviderName, oldPatterns);
-        }
-      } catch (error) {
-        console.warn(BG_LOG_PREFIX, `Error getting tab info for ${tabId} during re-attachment attempt:`, error.message);
-      }
-
-    } else {
-      console.log(BG_LOG_PREFIX, `Tab ${tabId} URL changed to ${tab.url}. Provider ${attachmentDetails.providerName} no longer valid or URL not supported by provider. Detaching debugger.`);
-      await detachDebugger(tabId);
-    }
-  } else if (attachmentDetails && attachmentDetails.isAttached && changeInfo.status === 'loading' && tab && tab.url && !changeInfo.url) {
-    // Sometimes URL change is only visible when status is 'loading' and tab.url is the new one.
-    // This is a more aggressive check.
-    const newUrl = tab.url;
-    console.log(BG_LOG_PREFIX, `Tab ${tabId} is loading new URL: ${newUrl}. Checking debugger status.`);
-    const providerStillValidForNewUrl = isUrlSupportedByProvider(newUrl, attachmentDetails.providerName);
-    if (!providerStillValidForNewUrl) {
-        console.log(BG_LOG_PREFIX, `Tab ${tabId} loading new URL ${newUrl}. Provider ${attachmentDetails.providerName} may no longer be valid. Detaching.`);
-        await detachDebugger(tabId);
-    }
-    // If provider is still valid, we'll let the 'complete' status handler above deal with re-attachment if needed,
-    // or rely on content script sending SET_DEBUGGER_TARGETS.
-  }
-});
-
-// Listen for tab updates to inject the WebSocket proxy if needed
-chrome.tabs.onUpdated.addListener((tabId, changeInfo, tab) => {
-  if (changeInfo.status === 'loading' && tab.url && tab.url.includes('chatgpt.com')) {
-    chrome.scripting.executeScript({
-      target: { tabId: tabId },
-      files: ['providers/websocket-proxy.js'],
-      world: 'MAIN'
-    });
-  }
-});
 // Listen for messages from Content Scripts and Popup
 chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
-  console.log("BACKGROUND: Received message:", message.type || message.action, "from tabId:", sender.tab ? sender.tab.id : 'popup/unknown');
+  const type = message.type || message.action;
   
-  if (message.type === "CONTENT_SCRIPT_LOADED") {
-    console.log("BACKGROUND: Content script loaded successfully on:", message.url, "hostname:", message.hostname);
-    sendResponse({ success: true, message: "Content script load acknowledged" });
+  if (type === "CONTENT_SCRIPT_LOADED") {
+    sendResponse({ success: true });
     return true;
   }
   
   if (sender.tab && sender.tab.id) {
-    activeTabId = sender.tab.id; // User's original logic for activeTabId
-    console.log(`BACKGROUND: Updated activeTabId to ${activeTabId} from sender`);
+    activeTabId = sender.tab.id;
   }
 
-  if (message.type === "SET_DEBUGGER_TARGETS") {
-      if (sender.tab && sender.tab.id) {
-          const tabId = sender.tab.id;
-          console.log(BG_LOG_PREFIX, `SET_DEBUGGER_TARGETS for tab ${tabId}, provider: ${message.providerName}, patterns:`, message.patterns);
-          attachDebuggerAndEnableFetch(tabId, message.providerName, message.patterns);
-          sendResponse({ status: "Debugger attachment initiated" });
-      } else {
-          console.error(BG_LOG_PREFIX, "SET_DEBUGGER_TARGETS message received without valid sender.tab.id");
-          sendResponse({ status: "Error: Missing tabId" });
-      }
-      return true; 
+  if (type === "SET_DEBUGGER_TARGETS") {
+    if (sender.tab && sender.tab.id) {
+      attachDebuggerAndEnableFetch(sender.tab.id, message.providerName, message.patterns);
+      sendResponse({ status: "Debugger attachment initiated" });
+    } else {
+      sendResponse({ status: "Error: Missing tabId" });
+    }
+    return true;
   } 
-  else if (message.type === "CHAT_RELAY_READY") {
-    console.log(`BACKGROUND: Content script ready in ${message.chatInterface} on tab ${sender.tab ? sender.tab.id : 'unknown'}`);
+  
+  if (type === "LOG_MESSAGE") {
+    sendRemoteLog(message.level, message.message, message.requestId);
+    sendResponse({ success: true });
+    return true;
+  } 
+  
+  if (type === "CHAT_RELAY_READY") {
     if (sender.tab && sender.tab.id) activeTabId = sender.tab.id;
     sendResponse({ success: true });
-    return true; // Indicate that sendResponse might be used (even if synchronously here)
-  } else if (message.action === "RESPONSE_CAPTURED") {
-    console.log(`BACKGROUND: Received captured response (OLD DOM METHOD) from content script on tab ${sender.tab ? sender.tab.id : 'unknown'} Request ID: ${message.requestId}`);
-    
+    return true;
+  } 
+
+  if (type === "RESPONSE_CAPTURED" || type === "CHAT_RESPONSE_FROM_DOM" || type === "CHAT_RESPONSE" || type === "FINAL_RESPONSE_TO_RELAY") {
+    const text = message.response || message.text || message.chunk;
     if (relaySocket && relaySocket.readyState === WebSocket.OPEN) {
-      console.log("BACKGROUND: Forwarding (OLD DOM) response to relay server:", message.response);
       relaySocket.send(JSON.stringify({
         type: "CHAT_RESPONSE", 
         requestId: message.requestId, 
-        response: message.response,
-        isFinal: true 
+        response: text,
+        isFinal: message.isFinal !== undefined ? message.isFinal : true 
       }));
       sendResponse({ success: true });
-      
-      if (lastRequestId === message.requestId) {
+      if (lastRequestId === message.requestId && (message.isFinal || message.isFinal === undefined)) {
+          const details = pendingRequestDetails.get(message.requestId);
+          if (details && typeof details.messageContent === 'string') {
+              lastSuccessfullyProcessedMessageText = details.messageContent;
+          }
           processingRequest = false;
-          console.log("BACKGROUND: Reset processingRequest after (OLD DOM) RESPONSE_CAPTURED.");
           processNextRequest();
       }
-
     } else {
-      console.error("BACKGROUND: Relay WS not connected, cannot forward (OLD DOM) response");
       sendResponse({ success: false, error: "Relay WebSocket not connected" });
-      if (lastRequestId === message.requestId) {
-          processingRequest = false;
-      }
     }
     return true; 
-  } else if (message.action === "GET_CONNECTION_STATUS") {
-    const isConnected = relaySocket && relaySocket.readyState === WebSocket.OPEN;
-    sendResponse({ connected: isConnected });
-    return true; // Indicate that sendResponse might be used
-  } else if (message.type === "CHAT_RESPONSE_FROM_DOM") {
-    console.log(`BACKGROUND: Received CHAT_RESPONSE_FROM_DOM from tab ${sender.tab ? sender.tab.id : 'unknown'} for requestId ${message.requestId}`);
-    const tabId = sender.tab ? sender.tab.id : null;
-    const tabInfo = tabId ? debuggerAttachedTabs.get(tabId) : null;
+  }
 
-    if (tabInfo && tabInfo.lastKnownRequestId === message.requestId && processingRequest) {
-        if (relaySocket && relaySocket.readyState === WebSocket.OPEN) {
-            relaySocket.send(JSON.stringify({
-                type: "CHAT_RESPONSE_CHUNK",
-                requestId: message.requestId,
-                chunk: message.text,
-                isFinal: message.isFinal !== undefined ? message.isFinal : true
-            }));
-            relaySocket.send(JSON.stringify({
-                type: "CHAT_RESPONSE_STREAM_ENDED",
-                requestId: message.requestId
-            }));
-            console.log(`BACKGROUND: Sent CHAT_RESPONSE_CHUNK (from DOM) and _STREAM_ENDED for app requestId: ${message.requestId}`);
-            sendResponse({ success: true, message: "DOM Response forwarded to relay." });
-        } else {
-            console.error(`BACKGROUND: Relay WS not connected, cannot send DOM-captured response for requestId: ${message.requestId}`);
-            sendResponse({ success: false, error: "Relay WebSocket not connected." });
-        }
-        // Finalize this request processing
-        processingRequest = false;
-        if (tabInfo) tabInfo.lastKnownRequestId = null; // Clear for this specific tab op
-        console.log(`BACKGROUND: Reset processingRequest. Cleared lastKnownRequestId for tab ${tabId} after DOM response.`);
-        processNextRequest();
-    } else {
-        console.warn(`BACKGROUND: Mismatched requestId or not processing for CHAT_RESPONSE_FROM_DOM. Current lastKnownRequestId: ${tabInfo ? tabInfo.lastKnownRequestId : 'N/A'}, processingRequest: ${processingRequest}, msg RequestId: ${message.requestId}`);
-        sendResponse({ success: false, error: "Mismatched requestId or not processing." });
+  if (type === "CHAT_RESPONSE_FROM_DOM_FAILED") {
+    if (relaySocket && relaySocket.readyState === WebSocket.OPEN) {
+      relaySocket.send(JSON.stringify({
+        type: "CHAT_RESPONSE_ERROR",
+        requestId: message.requestId,
+        error: `DOM fallback failed: ${message.error}`
+      }));
     }
-    return true;
-  } else if (message.type === "CHAT_RESPONSE_FROM_DOM_FAILED") {
-    console.error(`BACKGROUND: Received CHAT_RESPONSE_FROM_DOM_FAILED from tab ${sender.tab ? sender.tab.id : 'unknown'} for requestId ${message.requestId}: ${message.error}`);
-    const tabId = sender.tab ? sender.tab.id : null;
-    const tabInfo = tabId ? debuggerAttachedTabs.get(tabId) : null;
-
-    if (tabInfo && tabInfo.lastKnownRequestId === message.requestId && processingRequest) {
-        if (relaySocket && relaySocket.readyState === WebSocket.OPEN) {
-            relaySocket.send(JSON.stringify({
-                type: "CHAT_RESPONSE_ERROR",
-                requestId: message.requestId,
-                error: `Failed to capture response from DOM on tab ${tabId}: ${message.error}`
-            }));
-        }
-        sendResponse({ success: true, message: "DOM failure noted and error sent to relay." });
-        // Finalize this request processing
-        processingRequest = false;
-        if (tabInfo) tabInfo.lastKnownRequestId = null;
-        console.log(`BACKGROUND: Reset processingRequest. Cleared lastKnownRequestId for tab ${tabId} after DOM failure.`);
-        processNextRequest();
-    } else {
-        console.warn(`BACKGROUND: Mismatched requestId or not processing for CHAT_RESPONSE_FROM_DOM_FAILED. Current lastKnownRequestId: ${tabInfo ? tabInfo.lastKnownRequestId : 'N/A'}, processingRequest: ${processingRequest}, msg RequestId: ${message.requestId}`);
-        sendResponse({ success: false, error: "Mismatched requestId or not processing for DOM failure." });
-    }
-    return true;
-  } else if (message.type === "FINAL_RESPONSE_TO_RELAY") {
-      console.log(BG_LOG_PREFIX, `[REQ-${message.requestId}] RECEIVED FINAL_RESPONSE_TO_RELAY. FromTab: ${sender.tab ? sender.tab.id : 'N/A'}. HasError: ${!!message.error}. TextLength: ${message.text ? String(message.text).length : 'N/A'}. IsFinal: ${message.isFinal}. FullMsg:`, JSON.stringify(message).substring(0,500));
-      const tabId = sender.tab ? sender.tab.id : null;
-      const tabInfo = tabId ? debuggerAttachedTabs.get(tabId) : null;
-
-      // Update lastSuccessfullyProcessedMessageText regardless of current processing state,
-      // as this confirms a message text was fully processed by the AI.
-      const details = pendingRequestDetails.get(message.requestId);
-      if (details) {
-          if (typeof details.messageContent === 'string') {
-              lastSuccessfullyProcessedMessageText = details.messageContent;
-              console.log(`BACKGROUND: Updated lastSuccessfullyProcessedMessageText to: "${lastSuccessfullyProcessedMessageText.substring(0,50)}..." for completed requestId ${message.requestId}`);
-          } else {
-              console.log(`BACKGROUND: RequestId ${message.requestId} (messageContent type: ${typeof details.messageContent}) completed. lastSuccessfullyProcessedMessageText not updated with non-string content.`);
-          }
-          pendingRequestDetails.delete(message.requestId);
-      } else {
-          console.warn(`BACKGROUND: Received FINAL_RESPONSE_TO_RELAY for unknown requestId ${message.requestId} (not in pendingRequestDetails). Cannot update lastSuccessfullyProcessedMessageText accurately.`);
-      }
-
-      // Check if this is the request we are currently processing for state reset
-      if (processingRequest && lastRequestId === message.requestId) {
-          if (relaySocket && relaySocket.readyState === WebSocket.OPEN) {
-              if (message.error) { // Check if content.js sent an error (e.g., response too large)
-                  console.error(BG_LOG_PREFIX, `Content script reported an error for requestId ${message.requestId}: ${message.error}`);
-                  try {
-                      relaySocket.send(JSON.stringify({
-                          type: "CHAT_RESPONSE_ERROR",
-                          requestId: message.requestId,
-                          error: message.error
-                      }));
-                      console.log(BG_LOG_PREFIX, `Sent CHAT_RESPONSE_ERROR to server for requestId ${message.requestId} due to content script error.`);
-                      sendResponse({ success: true, message: "Error reported by content script sent to relay." });
-                  } catch (e) {
-                      console.error(BG_LOG_PREFIX, `Error sending CHAT_RESPONSE_ERROR to relay for requestId ${message.requestId}:`, e);
-                      sendResponse({ success: false, error: `Error sending CHAT_RESPONSE_ERROR to relay: ${e.message}` });
-                  }
-              } else { // No error from content.js, proceed to send data
-                  try {
-                      let responseText = message.text || "";
-                      
-                      // Decode text if it was encoded by content script
-                      if (message.encoded) {
-                          responseText = decodeURIComponent(responseText);
-                      }
-                      
-                      console.log(BG_LOG_PREFIX, `Attempting to send FINAL CHAT_RESPONSE_CHUNK for requestId ${message.requestId}. Data length: ${responseText.length}`);
-                      relaySocket.send(JSON.stringify({
-                          type: "CHAT_RESPONSE_CHUNK",
-                          requestId: message.requestId,
-                          chunk: responseText,
-                          isFinal: true
-                      }));
-                      console.log(BG_LOG_PREFIX, `Attempting to send CHAT_RESPONSE_STREAM_ENDED for requestId ${message.requestId}`);
-                      relaySocket.send(JSON.stringify({
-                          type: "CHAT_RESPONSE_STREAM_ENDED",
-                          requestId: message.requestId
-                      }));
-                      console.log(BG_LOG_PREFIX, `Successfully sent FINAL CHAT_RESPONSE_CHUNK and _STREAM_ENDED for app requestId: ${message.requestId} to relaySocket.`);
-                      sendResponse({ success: true, message: "Final response sent to relay." });
-                  } catch (e) {
-                      console.error(BG_LOG_PREFIX, `Error during relaySocket.send() for FINAL response (requestId ${message.requestId}):`, e);
-                      sendResponse({ success: false, error: `Error sending final response to relay: ${e.message}` });
-                  }
-              }
-          } else {
-              console.error(BG_LOG_PREFIX, `Relay WS not OPEN (state: ${relaySocket ? relaySocket.readyState : 'null'}), cannot send final response/error for app requestId: ${message.requestId}`);
-              sendResponse({ success: false, error: "Relay WebSocket not connected." });
-          }
-
-          // Finalize this request processing
-          console.log(BG_LOG_PREFIX, `Processing complete for command with app requestId: ${message.requestId} on tab ${tabId}`);
-          processingRequest = false;
-          if (tabInfo) tabInfo.lastKnownRequestId = null;
-          console.log(BG_LOG_PREFIX, `Reset processingRequest. Cleared lastKnownRequestId for tab ${tabId}.`);
-          processNextRequest();
-      } else {
-          console.warn(`BACKGROUND: Received FINAL_RESPONSE_TO_RELAY for requestId ${message.requestId}, but not currently processing it (current: ${lastRequestId}, processing: ${processingRequest}). Ignoring.`);
-          sendResponse({ success: false, error: "Request ID mismatch or not processing." });
-      }
-      return true; // Indicate async response potentially
-  } else if (message.type === "DUPLICATE_MESSAGE_HANDLED") {
-    console.log(`BACKGROUND: Content script handled requestId ${message.requestId} as a duplicate of text: "${message.originalText ? message.originalText.substring(0,50) : 'N/A'}..."`);
-    
-    // Update last successfully processed text because this text was confirmed as a duplicate of it.
-    lastSuccessfullyProcessedMessageText = message.originalText;
-    pendingRequestDetails.delete(message.requestId); // Clean up details map
-    console.log(`BACKGROUND: Updated lastSuccessfullyProcessedMessageText (due to duplicate) to: "${lastSuccessfullyProcessedMessageText ? lastSuccessfullyProcessedMessageText.substring(0,50) : 'N/A'}..."`);
-
-    if (processingRequest && lastRequestId === message.requestId) {
-        if (relaySocket && relaySocket.readyState === WebSocket.OPEN) {
-            relaySocket.send(JSON.stringify({
-                type: "CHAT_RESPONSE",
-                requestId: message.requestId,
-                response: `[ChatRelay Extension] Request to send duplicate message ("${message.originalText ? message.originalText.substring(0,100) : 'N/A'}") was detected and cleared from input. No message sent to AI.`,
-                isFinal: true
-            }));
-            console.log(`BACKGROUND: Sent CHAT_RESPONSE (for duplicate) to server for requestId: ${message.requestId}.`);
-        } else {
-            console.error(`BACKGROUND: Relay WS not OPEN, cannot send CHAT_RESPONSE (for duplicate) for requestId: ${message.requestId}.`);
-        }
-
-        processingRequest = false;
-        // lastRequestId remains, it's the ID of the last command *received*
-        // currentRequestText (if used) would be nulled here.
-        const tabInfo = sender.tab ? debuggerAttachedTabs.get(sender.tab.id) : null;
-        if (tabInfo && tabInfo.lastKnownRequestId === message.requestId) {
-             tabInfo.lastKnownRequestId = null;
-        }
-
-        console.log(`BACKGROUND: Reset processingRequest after DUPLICATE_MESSAGE_HANDLED for requestId: ${message.requestId}.`);
-        processNextRequest();
-    } else {
-        console.warn(`BACKGROUND: Received DUPLICATE_MESSAGE_HANDLED for requestId ${message.requestId}, but not currently processing it or ID mismatch. Current lastRequestId: ${lastRequestId}, processing: ${processingRequest}. Still updated LSPMT.`);
-        // If it was an older request, its details are cleaned, LSPMT updated. Server informed if possible.
-         if (relaySocket && relaySocket.readyState === WebSocket.OPEN) {
-            relaySocket.send(JSON.stringify({
-                type: "CHAT_RESPONSE",
-                requestId: message.requestId,
-                response: `[ChatRelay Extension] An older/superseded request (ID: ${message.requestId}, Text: "${message.originalText ? message.originalText.substring(0,100) : 'N/A'}") was handled as a duplicate.`,
-                isFinal: true
-            }));
-        }
-    }
-    sendResponse({ success: true, message: "Duplicate handling acknowledged by background." });
-    return true;
-  } else if (message.type === "USER_STOP_REQUEST") {
-    const requestIdToStop = message.requestId;
-    console.log(`BACKGROUND: Received USER_STOP_REQUEST for requestId: ${requestIdToStop}`);
-    let responseSent = false; // To ensure sendResponse is called once
-
-    // Case 1: The request to stop is the currently processing one.
-    if (processingRequest && lastRequestId === requestIdToStop) {
-        console.log(`BACKGROUND: Initiating stop for currently processing request: ${lastRequestId}. Content script will send FINAL_RESPONSE_TO_RELAY.`);
-        if (activeTabId) {
-            chrome.tabs.sendMessage(activeTabId, {
-                action: "STOP_STREAMING",
-                requestId: lastRequestId
-            }, response => {
-                if (chrome.runtime.lastError) {
-                    console.error(`BACKGROUND: Error sending STOP_STREAMING to tab ${activeTabId} for requestId ${lastRequestId}:`, chrome.runtime.lastError.message);
-                } else {
-                    console.log(`BACKGROUND: Sent STOP_STREAMING to tab ${activeTabId} for requestId ${lastRequestId}. Content script ack:`, response);
-                }
-            });
-        } else {
-            console.warn(`BACKGROUND: Cannot send STOP_STREAMING for currently processing requestId ${lastRequestId}, activeTabId is null. This request might not be properly finalized by the provider.`);
-            // If no active tab, we can't tell content.js to stop.
-            // We should still inform the relay and clean up what we can,
-            // though the provider state might remain for this request.
-            if (relaySocket && relaySocket.readyState === WebSocket.OPEN) {
-                relaySocket.send(JSON.stringify({
-                    type: "CHAT_RESPONSE_ERROR",
-                    requestId: lastRequestId,
-                    error: "Request cancelled by user (no active tab to signal provider)."
-                }));
-            }
-            // Since we can't rely on FINAL_RESPONSE_TO_RELAY, we have to clean up here.
-            processingRequest = false;
-            pendingRequestDetails.delete(lastRequestId);
-            // lastSuccessfullyProcessedMessageText = null; // Consider if this should be reset
-            console.log(`BACKGROUND: Forcefully reset processingRequest for ${lastRequestId} due to USER_STOP_REQUEST with no active tab.`);
-            processNextRequest(); // Attempt to process next
-        }
-
-        // Inform relay server about cancellation (can be done early)
-        if (relaySocket && relaySocket.readyState === WebSocket.OPEN) {
-            relaySocket.send(JSON.stringify({
-                type: "CHAT_RESPONSE_ERROR", // Or a new type like "USER_CANCELLED_REQUEST"
-                requestId: lastRequestId, // Use lastRequestId as it's the one being processed
-                error: "Request cancelled by user."
-            }));
-            console.log(`BACKGROUND: Sent CHAT_RESPONSE_ERROR (user cancelled) to server for currently processing requestId: ${lastRequestId}.`);
-        }
-        
-        // IMPORTANT: Do NOT set processingRequest = false or clear lastRequestId details here.
-        // Let the FINAL_RESPONSE_TO_RELAY (triggered by provider.stopStreaming) handle the final state cleanup.
-        sendResponse({ success: true, message: `Stop initiated for currently processing request ${lastRequestId}. Waiting for finalization from content script.` });
-        responseSent = true;
-
-    // Case 2: The request to stop is in the pending queue (not actively processing).
-    } else {
-        const initialQueueLength = pendingRequests.length;
-        pendingRequests = pendingRequests.filter(req => req.requestId !== requestIdToStop);
-        if (pendingRequests.length < initialQueueLength) {
-            console.log(`BACKGROUND: Removed requestId ${requestIdToStop} from pendingRequests queue.`);
-            pendingRequestDetails.delete(requestIdToStop); // Clean up details for the queued item
-
-            if (relaySocket && relaySocket.readyState === WebSocket.OPEN) {
-                 relaySocket.send(JSON.stringify({
-                    type: "CHAT_RESPONSE_ERROR",
-                    requestId: requestIdToStop,
-                    error: `Request ${requestIdToStop} cancelled by user while in queue.`
-                }));
-                console.log(`BACKGROUND: Sent CHAT_RESPONSE_ERROR (user cancelled in queue) to server for requestId: ${requestIdToStop}.`);
-            }
-            if (!responseSent) sendResponse({ success: true, message: `Request ${requestIdToStop} removed from queue.` });
-  } else if (message.type === 'WEBSOCKET_MESSAGE') {
-    if (activeTabId) {
-      chrome.tabs.sendMessage(activeTabId, {
-        action: 'HANDLE_WEBSOCKET_DATA',
-        requestId: lastRequestId,
-        data: message.data
-      });
-    }
-            responseSent = true;
-        }
-    }
-
-    if (!responseSent) {
-        console.warn(`BACKGROUND: USER_STOP_REQUEST for ${requestIdToStop}, but it was not actively processing nor found in the pending queue. Current active: ${lastRequestId}, processing: ${processingRequest}`);
-        sendResponse({ success: false, error: "Request not found processing or in queue." });
-    }
+    processingRequest = false;
+    processNextRequest();
+    sendResponse({ success: true });
     return true;
   }
-  // IMPORTANT: Add other top-level else if (message.action === "SAVE_SETTINGS") etc. here if they exist outside this snippet
+
+  if (type === "GET_CONNECTION_STATUS") {
+    sendResponse({ connected: relaySocket && relaySocket.readyState === WebSocket.OPEN });
+    return true;
+  }
 });
 
-// Listen for storage changes to update the server URL
 chrome.storage.onChanged.addListener((changes, namespace) => {
-  if (namespace === 'sync') {
-    let needsReconnect = false;
-    if (changes.serverHost || changes.serverPort || changes.serverProtocol) {
-        needsReconnect = true;
-    }
-    
-    if (needsReconnect) {
-      console.log("BACKGROUND: Server settings changed, reconnecting...");
-      if (relaySocket) {
-        relaySocket.close(); 
-      } else {
-        loadSettingsAndConnect(); 
-      }
-    }
+  if (namespace === 'sync' && (changes.serverHost || changes.serverPort || changes.serverProtocol)) {
+      if (relaySocket) relaySocket.close();
+      else loadSettingsAndConnect();
   }
 });
 
-// Initial setup
 loadSettingsAndConnect();
-
-// Placeholder for providerUtils if it's not globally available from another script.
-// In a real extension, this would likely be imported or part of a shared module.
-const providerUtils = {
-    _providers: {}, // providerName -> { instance, domains }
-    registerProvider: function(name, domains, instance) {
-        this._providers[name] = { instance, domains };
-        // console.log(BG_LOG_PREFIX, `Provider registered in background (simulated): ${name}`);
-    },
-    getProviderForUrl: function(url) {
-        for (const name in this._providers) {
-            if (this._providers[name].domains.some(domain => url.includes(domain))) {
-                return this._providers[name].instance;
-            }
-        }
-        return null;
-    },
-    // Simulate AIStudioProvider registration for isUrlSupportedByProvider
-    // This would normally happen if provider-utils.js was also loaded in background context
-    // or if this info was passed/stored differently.
-    _initializeSimulatedProviders: function() {
-        this.registerProvider("AIStudioProvider", ["aistudio.google.com"], { name: "AIStudioProvider" });
-        this.registerProvider("GeminiProvider", ["gemini.google.com"], { name: "GeminiProvider" });
-        this.registerProvider("ChatGPTProvider", ["chatgpt.com"], { name: "ChatGPTProvider" });
-        this.registerProvider("ClaudeProvider", ["claude.ai"], { name: "ClaudeProvider" });
-
-    }
-};
-providerUtils._initializeSimulatedProviders(); // Call to populate for the helper
-
-console.log("BACKGROUND: AI Chat Relay: Background Service Worker started.");
-
 
 // ===== DEBUGGER LOGIC =====
 async function attachDebuggerAndEnableFetch(tabId, providerName, patterns) {
+    console.log(`[BG DEBUGGER] Request to attach to tab ${tabId} for ${providerName} with patterns:`, JSON.stringify(patterns));
     if (!tabId || !patterns || patterns.length === 0) {
-        console.error(BG_LOG_PREFIX, `attachDebuggerAndEnableFetch: Invalid parameters for tab ${tabId}. Patterns:`, patterns);
+        console.error(`[BG DEBUGGER] Missing tabId or patterns. tabId: ${tabId}, patterns:`, patterns);
         return;
     }
     const debuggee = { tabId: tabId };
-    const requiredVersion = "1.3";
+    
+    // Safety check for internal URLs
+    try {
+        const tab = await chrome.tabs.get(tabId);
+        if (tab && tab.url && (tab.url.startsWith("chrome://") || tab.url.startsWith("about:") || tab.url.startsWith("chrome-extension://"))) {
+            console.log(`[BG DEBUGGER] Skipping attachment for internal URL: ${tab.url}`);
+            return;
+        }
+    } catch (e) {
+        console.warn(`[BG DEBUGGER] Could not verify tab ${tabId} URL before attachment:`, e.message);
+    }
 
     try {
         const existingAttachment = debuggerAttachedTabs.get(tabId);
-        if (existingAttachment && existingAttachment.isAttached) {
-            console.log(BG_LOG_PREFIX, `Already attached to tab ${tabId}. Ensuring Fetch is enabled with latest patterns.`);
-        } else {
-            console.log(BG_LOG_PREFIX, `Attempting to attach debugger to tab ${tabId}`);
+        if (!(existingAttachment && existingAttachment.isAttached)) {
+            console.log(`[BG DEBUGGER] Attaching chrome.debugger to tab ${tabId}...`);
             await new Promise((resolve, reject) => {
-                chrome.debugger.attach(debuggee, requiredVersion, () => {
+                chrome.debugger.attach(debuggee, "1.3", () => {
                     if (chrome.runtime.lastError) {
-                        console.error(BG_LOG_PREFIX, `Error attaching debugger to tab ${tabId}:`, chrome.runtime.lastError.message);
-                        debuggerAttachedTabs.delete(tabId);
+                        console.error(`[BG DEBUGGER] Attach failed for tab ${tabId}:`, chrome.runtime.lastError.message);
                         return reject(chrome.runtime.lastError);
                     }
-                    console.log(BG_LOG_PREFIX, `Successfully attached debugger to tab ${tabId}`);
-                    debuggerAttachedTabs.set(tabId, {
-                        providerName: providerName,
-                        patterns: patterns,
-                        isFetchEnabled: false,
-                        isAttached: true,
-                        lastKnownRequestId: null 
-                    });
+                    console.log(`[BG DEBUGGER] Successfully attached to tab ${tabId}.`);
+                    debuggerAttachedTabs.set(tabId, { providerName, patterns, isFetchEnabled: false, isAttached: true, lastKnownRequestId: null });
                     resolve();
                 });
             });
+        } else {
+            console.log(`[BG DEBUGGER] Already attached to tab ${tabId}.`);
         }
         
-        const currentTabDataForPatterns = debuggerAttachedTabs.get(tabId);
-        if (currentTabDataForPatterns) {
-            currentTabDataForPatterns.patterns = patterns; 
-            currentTabDataForPatterns.providerName = providerName; 
-        }
-
-        // Explicitly disable Fetch first, in case it's in a weird state
-        try {
-            console.log(BG_LOG_PREFIX, `Attempting to disable Fetch domain for tab ${tabId} before re-enabling.`);
-            await new Promise((resolve, reject) => {
-                chrome.debugger.sendCommand(debuggee, "Fetch.disable", {}, (disableResponse) => {
-                    if (chrome.runtime.lastError) {
-                        console.warn(BG_LOG_PREFIX, `Warning/Error disabling Fetch for tab ${tabId}:`, chrome.runtime.lastError.message);
-                        // Don't reject, just log, as we want to proceed to enable anyway
-                    } else {
-                        console.log(BG_LOG_PREFIX, `Successfully disabled Fetch for tab ${tabId}. Response:`, disableResponse);
-                    }
-                    resolve();
-                });
-            });
-        } catch (e) {
-            console.warn(BG_LOG_PREFIX, `Exception during explicit Fetch.disable for tab ${tabId}:`, e);
-        }
-
-        console.log(BG_LOG_PREFIX, `Enabling Fetch domain for tab ${tabId} with patterns:`, patterns);
+        console.log(`[BG DEBUGGER] Enabling Fetch.enable for tab ${tabId} with patterns...`);
         await new Promise((resolve, reject) => {
-            const fetchEnableParams = { patterns: patterns };
-            console.log(BG_LOG_PREFIX, `Preparing to call Fetch.enable for tab ${tabId} with params:`, JSON.stringify(fetchEnableParams));
-            chrome.debugger.sendCommand(debuggee, "Fetch.enable", fetchEnableParams, (response) => {
+            // CRITICAL: We MUST specify requestStage: "Response" to catch the body and status code!
+            chrome.debugger.sendCommand(debuggee, "Fetch.enable", { 
+                patterns: patterns.map(p => ({ urlPattern: p.urlPattern, requestStage: "Response" })) 
+            }, () => {
                 if (chrome.runtime.lastError) {
-                    console.error(BG_LOG_PREFIX, `Error enabling Fetch for tab ${tabId}:`, chrome.runtime.lastError.message);
+                    console.error(`[BG DEBUGGER] Fetch.enable failed for tab ${tabId}:`, chrome.runtime.lastError.message);
                     return reject(chrome.runtime.lastError);
                 }
-                console.log(BG_LOG_PREFIX, `Successfully enabled Fetch for tab ${tabId}. Response from Fetch.enable:`, response);
+                console.log(`[BG DEBUGGER] Fetch.enable SUCCESS for tab ${tabId}.`);
                 const currentTabData = debuggerAttachedTabs.get(tabId);
-                if (currentTabData) {
-                    currentTabData.isFetchEnabled = true;
-                }
+                if (currentTabData) currentTabData.isFetchEnabled = true;
                 resolve();
             });
         });
-    } catch (error) {
-        console.error(BG_LOG_PREFIX, `Error in attachDebuggerAndEnableFetch for tab ${tabId}:`, error);
-        // Ensure flags are reset on error
-        const currentTabDataOnError = debuggerAttachedTabs.get(tabId);
-        if (currentTabDataOnError) {
-            currentTabDataOnError.isFetchEnabled = false; // Ensure this is false
-            // if (!currentTabDataOnError.isAttached) { // Commenting out: if attach failed earlier, it's already deleted. If attach succeeded but enable failed, we want to keep attachment info.
-            //     debuggerAttachedTabs.delete(tabId);
-            // }
-        }
+    } catch (e) {
+        console.error(`[BG DEBUGGER] Error in attach sequence for tab ${tabId}:`, e);
     }
 }
 
@@ -957,259 +431,65 @@ async function detachDebugger(tabId) {
     if (!tabId) return;
     const attachmentDetails = debuggerAttachedTabs.get(tabId);
     if (attachmentDetails && attachmentDetails.isAttached) {
-        console.log(BG_LOG_PREFIX, `Attempting to detach debugger from tab ${tabId}`);
-        try {
-            await new Promise((resolve, reject) => {
-                chrome.debugger.detach({ tabId: tabId }, () => {
-                    if (chrome.runtime.lastError) {
-                        console.error(BG_LOG_PREFIX, `Error detaching debugger from tab ${tabId}:`, chrome.runtime.lastError.message);
-                    } else {
-                        console.log(BG_LOG_PREFIX, `Successfully detached debugger from tab ${tabId}`);
-                    }
-                    debuggerAttachedTabs.delete(tabId);
-                    resolve(); // Resolve even if detach had an error, as we've cleaned up map
-                });
-            });
-        } catch (error) { // Catch errors from the Promise constructor itself or unhandled rejections
-            console.error(BG_LOG_PREFIX, `Exception during detach for tab ${tabId}:`, error);
-            debuggerAttachedTabs.delete(tabId); // Ensure cleanup
-        }
-    } else {
-        // If not attached or no details, still ensure it's not in the map
-        debuggerAttachedTabs.delete(tabId);
+        chrome.debugger.detach({ tabId }, () => {
+            debuggerAttachedTabs.delete(tabId);
+        });
     }
 }
 
-chrome.tabs.onRemoved.addListener((tabId, removeInfo) => {
-    console.log(BG_LOG_PREFIX, `Tab ${tabId} removed. Detaching debugger if attached.`);
-    detachDebugger(tabId);
-});
-
+chrome.tabs.onRemoved.addListener(detachDebugger);
 chrome.runtime.onSuspend.addListener(() => {
-    console.log(BG_LOG_PREFIX, "Extension suspending. Detaching all debuggers.");
-    for (const tabId of debuggerAttachedTabs.keys()) {
-        detachDebugger(tabId);
-    }
+    for (const tabId of debuggerAttachedTabs.keys()) detachDebugger(tabId);
 });
 
-chrome.debugger.onDetach.addListener((source, reason) => {
-    if (source.tabId) {
-        console.log(BG_LOG_PREFIX, `Debugger detached from tab ${source.tabId} (e.g. DevTools closed) due to: ${reason}. Cleaning up.`);
-        debuggerAttachedTabs.delete(source.tabId);
-    }
+chrome.debugger.onDetach.addListener((source) => {
+    if (source.tabId) debuggerAttachedTabs.delete(source.tabId);
 });
 
 chrome.debugger.onEvent.addListener((debuggeeId, message, params) => {
-    if (!debuggeeId.tabId) return;
+    if (!debuggeeId.tabId || message !== "Fetch.requestPaused") return;
     const tabId = debuggeeId.tabId;
     const tabInfo = debuggerAttachedTabs.get(tabId);
+    
+    // Fallback to global lastRequestId if tab-specific one isn't set yet
+    const currentOperationRequestId = (tabInfo && tabInfo.lastKnownRequestId !== null) 
+        ? tabInfo.lastKnownRequestId 
+        : lastRequestId;
 
-    // DEVELOPER ACTION: This parsing function needs to be robustly implemented
-    // based on consistent observation of the AI Studio response structure.
-    function parseAiStudioResponse(jsonString) {
-        try {
-            const parsed = JSON.parse(jsonString);
-            let combinedText = "";
-            if (Array.isArray(parsed)) {
-                for (const topLevelEntry of parsed) {
-                    if (topLevelEntry && topLevelEntry[0] && topLevelEntry[0][2] && Array.isArray(topLevelEntry[0][2])) {
-                        for (const candidateBlock of topLevelEntry[0][2]) {
-                            if (candidateBlock && candidateBlock[0] && candidateBlock[0][0] && candidateBlock[0][0][0] && Array.isArray(candidateBlock[0][0][0][0])) {
-                                for (const innerMostArray of candidateBlock[0][0][0][0]) {
-                                    if (Array.isArray(innerMostArray) && innerMostArray.length > 1 && typeof innerMostArray[1] === 'string') {
-                                        const textSegment = innerMostArray[1];
-                                        // Basic heuristic to filter out "thought process" or similar meta-commentary.
-                                        // This will need refinement based on actual response variations.
-                                        if (!textSegment.toLowerCase().includes("thinking process") &&
-                                            !textSegment.toLowerCase().includes("thought process") &&
-                                            !textSegment.startsWith("1.") && // Avoid numbered list from thoughts
-                                            !textSegment.startsWith("2.") &&
-                                            !textSegment.startsWith("3.") &&
-                                            !textSegment.startsWith("4.") &&
-                                            !textSegment.startsWith("5.") &&
-                                            !textSegment.startsWith("6.") &&
-                                            textSegment.trim() !== "**") {
-                                            combinedText += textSegment; // Concatenate, newlines are part of the text
-                                        }
-                                    }
-                                }
-                            }
-                        }
-                    }
-                }
-            }
-            // Cleanup common markdown/formatting that might not be desired for relay
-            let cleanedMessage = combinedText.replace(/\*\*/g, "").replace(/\\n/g, "\n").replace(/\n\s*\n/g, '\n').trim();
-            
-            if (cleanedMessage) {
-                console.log(BG_LOG_PREFIX, "Parsed AI Studio response to (first 100 chars):", cleanedMessage.substring(0, 100));
-                return cleanedMessage;
-            } else {
-                console.warn(BG_LOG_PREFIX, "Parsing AI Studio response yielded empty text. Original (first 200 chars):", jsonString.substring(0,200));
-            }
-        } catch (e) {
-            console.error(BG_LOG_PREFIX, "Error parsing AI Studio response JSON:", e, "Original string (first 200 chars):", jsonString.substring(0, 200));
-        }
-        console.warn(BG_LOG_PREFIX, "Failed to extract clean text from AI Studio response, returning raw data.");
-        return jsonString;
+    if (!tabInfo || !tabInfo.isFetchEnabled || currentOperationRequestId === null) {
+        chrome.debugger.sendCommand(debuggeeId, "Fetch.continueRequest", { requestId: params.requestId });
+        return;
+    }
+    const matchesPattern = tabInfo.patterns.some(p => {
+        const patternRegex = new RegExp(String(p.urlPattern).replace(/[.*+?^${}()|[\]\\]/g, '\\$&').replace(/\\\*/g, '.*?'));
+        return patternRegex.test(params.request.url);
+    });
+
+    if (!matchesPattern) {
+        chrome.debugger.sendCommand(debuggeeId, "Fetch.continueRequest", { requestId: params.requestId });
+        return;
     }
 
-    if (message === "Fetch.requestPaused") {
-        // Log immediately upon entering Fetch.requestPaused
-        console.log(BG_LOG_PREFIX, `ENTERED Fetch.requestPaused for tab ${tabId}, URL: ${params.request.url}, Debugger NetworkRequestId: ${params.requestId}, Stage: ${params.responseErrorReason || params.requestStage}, Headers:`, params.request.headers);
-
-        if (!tabInfo) {
-            console.warn(BG_LOG_PREFIX, `Fetch.requestPaused for tab ${tabId} but NO tabInfo found in debuggerAttachedTabs. Continuing request.`);
-            chrome.debugger.sendCommand(debuggeeId, "Fetch.continueRequest", { requestId: params.requestId });
-            return;
-        }
-        if (!tabInfo.isFetchEnabled) {
-            console.log(BG_LOG_PREFIX, `Tab ${tabId} not actively monitored or Fetch not enabled (tabInfo.isFetchEnabled is false). Continuing request.`);
-            chrome.debugger.sendCommand(debuggeeId, "Fetch.continueRequest", { requestId: params.requestId });
-            return;
-        }
-
-        // This is the application's requestId (e.g., 0, 1, 2...)
-        // It's CRITICAL that tabInfo.lastKnownRequestId is correctly set when the command was initially forwarded.
-        const currentOperationRequestId = tabInfo.lastKnownRequestId;
-
-        if (currentOperationRequestId === null || currentOperationRequestId === undefined) {
-            console.warn(BG_LOG_PREFIX, `Fetch.requestPaused for tab ${tabId} (URL: ${params.request.url}) but tabInfo.lastKnownRequestId is null/undefined. Cannot associate with an operation. Continuing request.`);
-            chrome.debugger.sendCommand(debuggeeId, "Fetch.continueRequest", { requestId: params.requestId });
-            return;
-        }
-        
-        // Check if the URL matches any of the patterns for this tab
-        const matchesPattern = tabInfo.patterns.some(p => {
-            try {
-                // Ensure the pattern is treated as a string and properly escaped for regex construction.
-                // Basic wildcard to regex: replace * with .*? (non-greedy)
-                const patternRegex = new RegExp(String(p.urlPattern).replace(/[.*+?^${}()|[\]\\]/g, '\\$&').replace(/\\\*/g, '.*?'));
-                return patternRegex.test(params.request.url);
-            } catch (e) {
-                console.error(BG_LOG_PREFIX, `Error creating regex from pattern '${p.urlPattern}':`, e);
-                return false;
-            }
-        });
-
-        if (!matchesPattern) {
-            // console.log(BG_LOG_PREFIX, `Fetch.requestPaused for URL ${params.request.url} did NOT match stored patterns for tab ${tabId}. Continuing request. Patterns:`, tabInfo.patterns);
-            chrome.debugger.sendCommand(debuggeeId, "Fetch.continueRequest", { requestId: params.requestId });
-            return;
-        }
-        console.log(BG_LOG_PREFIX, `Fetch.requestPaused for URL ${params.request.url} MATCHED pattern. App RequestId: ${currentOperationRequestId}. Proceeding...`);
-        
-        console.log(BG_LOG_PREFIX, `[DEBUG_STAGE_STATUS] For matched URL ${params.request.url}, appReqId: ${currentOperationRequestId}, debugger netReqId: ${params.requestId}:`);
-        console.log(BG_LOG_PREFIX, `  - params.requestStage: ${params.requestStage}`);
-        console.log(BG_LOG_PREFIX, `  - params.responseStatusCode: ${params.responseStatusCode}`);
-        console.log(BG_LOG_PREFIX, `  - params.responseErrorReason: ${params.responseErrorReason}`);
-
-        // Additional pre-condition logging
-        console.log(BG_LOG_PREFIX, `[PRE-CONDITION CHECK] For AppReqId: ${currentOperationRequestId}, Debugger netReqId: ${params.requestId}`);
-        console.log(BG_LOG_PREFIX, `  - tabInfo (raw):`, tabInfo); // Log the raw tabInfo object
-        console.log(BG_LOG_PREFIX, `  - tabInfo.patterns:`, tabInfo ? JSON.stringify(tabInfo.patterns) : "tabInfo is null");
-        console.log(BG_LOG_PREFIX, `  - tabInfo.lastKnownRequestId: ${tabInfo ? tabInfo.lastKnownRequestId : "tabInfo is null"} (should be currentOperationRequestId)`);
-        console.log(BG_LOG_PREFIX, `  - currentOperationRequestId (derived from tabInfo.lastKnownRequestId): ${currentOperationRequestId}`);
-
-        // Scenario 1: Network error before even getting a response status (e.g., DNS failure)
-        if (params.responseErrorReason) {
-            console.error(BG_LOG_PREFIX, `Response error for ${params.request.url} (debugger netReqId ${params.requestId}): ${params.responseErrorReason}. AppReqId: ${currentOperationRequestId}.`);
-            const messageToContent = {
-                type: "PROVIDER_DEBUGGER_EVENT", // Ensure this type is handled by content.js
-                detail: {
-                    requestId: currentOperationRequestId,
-                    networkRequestId: params.requestId,
-                    error: `Network error: ${params.responseErrorReason}`,
-                    isFinal: true
+    if (params.responseStatusCode && params.responseStatusCode >= 200 && params.responseStatusCode < 300) {
+        chrome.debugger.sendCommand(debuggeeId, "Fetch.getResponseBody", { requestId: params.requestId }, (responseBodyData) => {
+            let processedData = null;
+            if (responseBodyData && responseBodyData.body) {
+                if (responseBodyData.base64Encoded) {
+                    try {
+                        processedData = new TextDecoder('utf-8').decode(Uint8Array.from(atob(responseBodyData.body), c => c.charCodeAt(0)));
+                    } catch (e) { processedData = responseBodyData.body; }
+                } else {
+                    processedData = responseBodyData.body;
                 }
-            };
-            chrome.tabs.sendMessage(tabId, messageToContent, response => {
-                if (chrome.runtime.lastError) console.error(BG_LOG_PREFIX, `Error sending debugger error event (responseErrorReason) to content script for tab ${tabId}:`, chrome.runtime.lastError.message);
-                else console.log(BG_LOG_PREFIX, `Sent debugger error event (responseErrorReason) to content script for tab ${tabId}, appReqId: ${currentOperationRequestId}, ack:`, response);
-            });
-            chrome.debugger.sendCommand(debuggeeId, "Fetch.continueRequest", { requestId: params.requestId });
-            return;
-        }
-
-        // Scenario 2: We have response headers (indicated by params.responseStatusCode being present).
-        if (params.responseStatusCode) {
-            if (params.responseStatusCode >= 200 && params.responseStatusCode < 300) {
-                // SUCCESS: We have a 2xx status, attempt to get the response body.
-                console.log(BG_LOG_PREFIX, `Attempting Fetch.getResponseBody for ${params.request.url}, appReqId: ${currentOperationRequestId}, debugger netReqId: ${params.requestId} (Stage: ${params.requestStage}, Status: ${params.responseStatusCode})`);
-                chrome.debugger.sendCommand(debuggeeId, "Fetch.getResponseBody", { requestId: params.requestId }, (responseBodyData) => {
-                    let errorMessageForContent = null; 
-                    if (chrome.runtime.lastError) {
-                        errorMessageForContent = `Error calling Fetch.getResponseBody: ${chrome.runtime.lastError.message}`;
-                        console.error(BG_LOG_PREFIX, `${errorMessageForContent} for tab ${tabId}, appReqId: ${currentOperationRequestId}, debugger netReqId: ${params.requestId}`);
-                    }
-                    
-                    console.log(BG_LOG_PREFIX, `[getResponseBody CB] appReqId: ${currentOperationRequestId}, netReqId: ${params.requestId}. responseBodyData raw:`, responseBodyData);
-                    if (responseBodyData) {
-                        console.log(BG_LOG_PREFIX, `[getResponseBody CB] responseBodyData.body (first 100): ${responseBodyData.body ? String(responseBodyData.body).substring(0,100) : 'N/A'}, .base64Encoded: ${responseBodyData.base64Encoded}`);
-                    }
-                    console.log(BG_LOG_PREFIX, `[getResponseBody CB] errorMessageForContent before check: '${errorMessageForContent}'`);
-
-                    if (!responseBodyData && !errorMessageForContent) { 
-                        errorMessageForContent = "No response body data and no explicit error from getResponseBody.";
-                        console.warn(BG_LOG_PREFIX, `${errorMessageForContent} for tab ${tabId}, appReqId: ${currentOperationRequestId}, debugger netReqId: ${params.requestId}`);
-                    }
-                    console.log(BG_LOG_PREFIX, `[getResponseBody CB] errorMessageForContent AFTER check: '${errorMessageForContent}'`);
-
-                    // Text encoding fix: properly decode base64-encoded response bodies
-                    let processedData = null;
-                    if (responseBodyData && responseBodyData.body) {
-                        if (responseBodyData.base64Encoded) {
-                            try {
-                                processedData = new TextDecoder('utf-8').decode(Uint8Array.from(atob(responseBodyData.body), c => c.charCodeAt(0)));
-                            } catch (error) {
-                                console.error(BG_LOG_PREFIX, `Error decoding base64 response body for requestId ${params.requestId}:`, error);
-                                processedData = responseBodyData.body; // Fallback to original
-                            }
-                        } else {
-                            processedData = responseBodyData.body;
-                        }
-                    }
-
-                    const messageToContent = {
-                        type: "PROVIDER_DEBUGGER_EVENT",
-                        detail: {
-                            requestId: currentOperationRequestId,
-                            networkRequestId: params.requestId,
-                            data: processedData,
-                            base64Encoded: false, // Always false since we've decoded it
-                            error: errorMessageForContent,
-                            isFinal: true 
-                        }
-                    };
-                    console.log(BG_LOG_PREFIX, `Sending PROVIDER_DEBUGGER_EVENT (body/error) to content script for tab ${tabId}, appReqId: ${currentOperationRequestId}. Error: ${errorMessageForContent}, Data (first 100): ${messageToContent.detail.data ? String(messageToContent.detail.data).substring(0,100) + "..." : "null"}`);
-                    chrome.tabs.sendMessage(tabId, messageToContent, response => {
-                         if (chrome.runtime.lastError) console.error(BG_LOG_PREFIX, `Error sending/acking debugger event (body/error) to content script for tab ${tabId}:`, chrome.runtime.lastError.message);
-                         else console.log(BG_LOG_PREFIX, `Sent debugger event (body/error) to content script for tab ${tabId}, appReqId: ${currentOperationRequestId}, ack:`, response);
-                    });
-                });
-            } else { // Non-2xx status code
-                const httpErrorMessage = `HTTP error ${params.responseStatusCode} for ${params.request.url}`;
-                console.error(BG_LOG_PREFIX, `${httpErrorMessage}. AppReqId: ${currentOperationRequestId}, Debugger netReqId: ${params.requestId}.`);
-                const messageToContent = {
-                    type: "PROVIDER_DEBUGGER_EVENT",
-                    detail: {
-                        requestId: currentOperationRequestId,
-                        networkRequestId: params.requestId,
-                        error: httpErrorMessage,
-                        isFinal: true
-                    }
-                };
-                chrome.tabs.sendMessage(tabId, messageToContent, response => {
-                    if (chrome.runtime.lastError) console.error(BG_LOG_PREFIX, `Error sending debugger HTTP error event to content script for tab ${tabId}:`, chrome.runtime.lastError.message);
-                    else console.log(BG_LOG_PREFIX, `Sent debugger HTTP error event to content script for tab ${tabId}, appReqId: ${currentOperationRequestId}, ack:`, response);
-                });
-                chrome.debugger.sendCommand(debuggeeId, "Fetch.continueRequest", { requestId: params.requestId });
             }
-        } else {
-            // No response headers yet (no params.responseStatusCode), and no responseErrorReason.
-            // This could be an earlier stage of the request or one not relevant for body capture.
-            console.log(BG_LOG_PREFIX, `Request for ${params.request.url} (debugger netReqId: ${params.requestId}, appReqId: ${currentOperationRequestId}) does not have responseStatusCode. Stage: ${params.requestStage}. Continuing request.`);
+            chrome.tabs.sendMessage(tabId, {
+                type: "PROVIDER_DEBUGGER_EVENT",
+                detail: { requestId: currentOperationRequestId, networkRequestId: params.requestId, data: processedData, isFinal: true }
+            });
+            // CRITICAL: Continue the request so the page can actually receive it!
             chrome.debugger.sendCommand(debuggeeId, "Fetch.continueRequest", { requestId: params.requestId });
-        }
+        });
+    } else {
+        chrome.debugger.sendCommand(debuggeeId, "Fetch.continueRequest", { requestId: params.requestId });
     }
 });

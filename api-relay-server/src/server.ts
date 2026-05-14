@@ -110,6 +110,7 @@ console.log(`SERVER.TS: Initial effective settings - Strategy: ${newRequestBehav
 interface PendingRequest {
   resolve: (value: any) => void;
   reject: (reason?: any) => void;
+  accumulatedResponse?: string;
 }
 interface WebSocketMessage {
   type: string;
@@ -123,6 +124,7 @@ interface WebSocketMessage {
     model?: string;
     temperature?: number;
     max_tokens?: number;
+    new_chat?: boolean;
   };
 }
 
@@ -134,6 +136,7 @@ interface QueuedRequest {
   model?: string;
   temperature?: number;
   max_tokens?: number;
+  new_chat?: boolean;
 }
 let requestQueue: QueuedRequest[] = [];
 
@@ -404,8 +407,34 @@ wss.on('connection', (ws: WebSocket) => {
         // processing a request and mark it as "Cancelled (Extension Refreshed)".
         // For now, the disconnect/reconnect logic based on socketId handles most stale states.
         return;
+      } else if (data.type === 'PING') {
+        // Heartbeat, no response needed but we acknowledge it in debug logs if needed
+        return;
+      } else if (data.type === 'LOG_MESSAGE') {
+        // Log messages from the extension to the admin log
+        logAdminMessage('EXTENSION_LOG', data.requestId || 'N/A', { 
+            socketId: currentSocketId, 
+            logLevel: (data as any).level || 'info', 
+            logMessage: (data as any).message 
+        }).catch(err => console.error("ADMIN_LOG_ERROR:", err));
+        return;
       } else if (data.type === 'CHAT_RESPONSE') {
-        responseDataToUse = data.response;
+        const pendingRequest = pendingRequests.get(data.requestId!);
+        if (pendingRequest) {
+          // Buffer the response
+          pendingRequest.accumulatedResponse = data.response;
+          
+          if (data.isFinal === true) {
+            responseDataToUse = pendingRequest.accumulatedResponse;
+            console.log(`SERVER.TS: CHAT_RESPONSE is FINAL for requestId: ${data.requestId}. Data length: ${responseDataToUse?.length}`);
+          } else {
+            console.log(`SERVER.TS: CHAT_RESPONSE partial for requestId: ${data.requestId}. Buffering...`);
+            return; // Don't process yet, wait for final
+          }
+        } else {
+          console.warn(`SERVER.TS: Received CHAT_RESPONSE for unknown requestId: ${data.requestId}`);
+          return;
+        }
       } else if (data.type === 'CHAT_RESPONSE_CHUNK' && data.isFinal === true) {
         responseDataToUse = data.chunk;
       } else if (data.type === 'CHAT_RESPONSE_ERROR') {
@@ -495,7 +524,7 @@ async function logAdminMessage(type: AdminLogEntry['type'], requestId: string | 
 }
 
 async function processOrQueueRequest(queuedItem: QueuedRequest): Promise<void> {
-  const { requestId, req, res, userMessage, model, temperature, max_tokens } = queuedItem;
+  const { requestId, req, res, userMessage, model, temperature, max_tokens, new_chat } = queuedItem;
 
   logAdminMessage('CHAT_REQUEST_RECEIVED', requestId, { 
     fromClient: userMessage, 
@@ -559,7 +588,7 @@ async function processOrQueueRequest(queuedItem: QueuedRequest): Promise<void> {
     });
 
     // const extension = activeConnections[0]; // Moved up to set activeExtensionSocketId
-    const messageToExtension: WebSocketMessage = { type: 'SEND_CHAT_MESSAGE', requestId, message: userMessage, settings: { model, temperature, max_tokens } };
+    const messageToExtension: WebSocketMessage = { type: 'SEND_CHAT_MESSAGE', requestId, message: userMessage, settings: { model, temperature, max_tokens, new_chat } };
     extension.send(JSON.stringify(messageToExtension));
     console.log(`SERVER.TS: Request ${requestId} sent to extension.`);
 
@@ -616,7 +645,7 @@ const apiRouter: Router = express.Router();
 
 apiRouter.post('/chat/completions', async (req: Request, res: Response): Promise<void> => {
   const requestId = requestCounter++;
-  const { messages, model, temperature, max_tokens, stream } = req.body;
+  const { messages, model, temperature, max_tokens, stream, new_chat } = req.body;
 
   // Basic validation
   if (!messages || !Array.isArray(messages) || messages.length === 0) {
@@ -631,12 +660,19 @@ apiRouter.post('/chat/completions', async (req: Request, res: Response): Promise
       return;
   }
 
+  // Smart Session Management for IDE Agents (Continue, Cursor, etc.)
+  // 1. If messages.length is 1, it's the start of a new thread -> Use New Chat.
+  // 2. If messages.length > 1, it's a follow-up -> Stay in the current thread.
+  // 3. User can still override this manually with the 'new_chat' flag in the body.
+  const isNewConversation = messages.length === 1;
+  const effectiveNewChat = new_chat !== undefined ? new_chat : isNewConversation;
+
   // Acknowledge stream, but don't implement it yet to keep the fix simple.
   if (stream) {
     console.log(`SERVER.TS: Request ${requestId} requested streaming. The server will process this as a non-streaming request for now.`);
   }
 
-  const queuedItem: QueuedRequest = { requestId, req, res, userMessage, model, temperature, max_tokens };
+  const queuedItem: QueuedRequest = { requestId, req, res, userMessage, model, temperature, max_tokens, new_chat: effectiveNewChat };
   processOrQueueRequest(queuedItem).catch(e => {
       console.error(`SERVER.TS: Unhandled error from processOrQueueRequest in /chat/completions for ${requestId}:`, e);
       if (!res.headersSent) {
@@ -689,6 +725,7 @@ apiRouter.post('/admin/restart-server', (req: Request, res: Response): void => {
 });
 
 app.use('/v1', apiRouter);
+app.use('/', apiRouter); // Also support root-level OpenAI paths for better compatibility
 
 app.get('/health', (req: Request, res: Response) => {
   const aliveConnections = activeConnections.filter(conn => conn.readyState === WebSocket.OPEN);
@@ -710,48 +747,57 @@ function handlePortConflict(portToFree: number, autoKillEnabled: boolean) {
 
   console.log(`Checking if port ${portToFree} is in use...`);
   try {
-    // Command to find process using the port (Windows specific)
-    const command = `netstat -ano -p TCP | findstr ":${portToFree}.*LISTENING"`;
-    const output = execSync(command, { encoding: 'utf-8' });
+    const isWindows = os.platform() === 'win32';
+    let pid: string | null = null;
 
-    if (output) {
-      console.log(`Port ${portToFree} is in use. Output:\n${output}`);
-      // Extract PID - Example: TCP    0.0.0.0:3003           0.0.0.0:0              LISTENING       12345
-      // PID is the last number on the line.
-      const lines = output.trim().split('\n');
-      if (lines.length > 0) {
-        const firstLine = lines[0];
-        const parts = firstLine.trim().split(/\s+/);
-        const pid = parts[parts.length - 1];
-
-        if (pid && !isNaN(parseInt(pid))) {
-          console.log(`Attempting to kill process with PID: ${pid} using port ${portToFree}`);
-          try {
-            execSync(`taskkill /PID ${pid} /F`);
-            console.log(`Successfully killed process ${pid} using port ${portToFree}.`);
-            logAdminMessage('PORT_KILLED', `PORT_${portToFree}`, { port: portToFree, pid: pid, status: 'success' })
-              .catch(err => console.error("ADMIN_LOG_ERROR (PORT_KILLED):", err));
-          } catch (killError) {
-            console.error(`Failed to kill process ${pid} using port ${portToFree}:`, killError);
-            logAdminMessage('PORT_KILL_FAILED', `PORT_${portToFree}`, { port: portToFree, pid: pid, status: 'failure', error: (killError as Error).message })
-              .catch(err => console.error("ADMIN_LOG_ERROR (PORT_KILL_FAILED):", err));
+    if (isWindows) {
+      const command = `netstat -ano -p TCP | findstr ":${portToFree}.*LISTENING"`;
+      try {
+        const output = execSync(command, { encoding: 'utf-8' });
+        if (output) {
+          const lines = output.trim().split('\n');
+          if (lines.length > 0) {
+            const parts = lines[0].trim().split(/\s+/);
+            pid = parts[parts.length - 1];
           }
-        } else {
-          console.warn(`Could not extract a valid PID for port ${portToFree} from netstat output: ${firstLine}`);
         }
-      } else {
-        console.log(`No process found listening on port ${portToFree} from netstat output.`);
+      } catch (e: any) {
+        if (e.status !== 1) throw e; // 1 means not found
       }
     } else {
-      console.log(`Port ${portToFree} is free.`);
+      try {
+        const output = execSync(`lsof -t -i:${portToFree}`, { encoding: 'utf-8' });
+        pid = output.trim().split('\n')[0]; // Get the first PID if multiple
+      } catch (e: any) {
+        // lsof returns non-zero if no process found
+        pid = null;
+      }
+    }
+
+    if (pid && !isNaN(parseInt(pid))) {
+      console.log(`Attempting to kill process with PID: ${pid} using port ${portToFree}`);
+      try {
+        if (isWindows) {
+          execSync(`taskkill /PID ${pid} /F`);
+        } else {
+          execSync(`kill -9 ${pid}`);
+        }
+        console.log(`Successfully killed process ${pid} using port ${portToFree}. Waiting 1s for port to release...`);
+        // Add a small delay to allow the OS to release the port
+        execSync(isWindows ? 'timeout /t 1 /nobreak' : 'sleep 1');
+        
+        logAdminMessage('PORT_KILLED', `PORT_${portToFree}`, { port: portToFree, pid: pid, status: 'success' })
+          .catch(err => console.error("ADMIN_LOG_ERROR (PORT_KILLED):", err));
+      } catch (killError) {
+        console.error(`Failed to kill process ${pid} using port ${portToFree}:`, killError);
+        logAdminMessage('PORT_KILL_FAILED', `PORT_${portToFree}`, { port: portToFree, pid: pid, status: 'failure', error: (killError as Error).message })
+          .catch(err => console.error("ADMIN_LOG_ERROR (PORT_KILL_FAILED):", err));
+      }
+    } else {
+      console.log(`Port ${portToFree} appears to be free.`);
     }
   } catch (error: any) {
-    // If findstr returns an error, it usually means the port is not found / not in use.
-    if (error.status === 1) { // findstr exits with 1 if string not found
-      console.log(`Port ${portToFree} appears to be free (netstat/findstr did not find it).`);
-    } else {
-      console.error(`Error checking port ${portToFree}:`, error.message);
-    }
+    console.error(`Error checking port ${portToFree}:`, error.message);
   }
 }
 

@@ -21,6 +21,20 @@
 const CS_LOG_PREFIX = '[CS CONTENT]';
 console.log(CS_LOG_PREFIX, "Content Script Injected & Loaded");
 
+// Helper to send logs to background script for remote logging
+function logRemote(level, message, requestId = null) {
+    chrome.runtime.sendMessage({
+        type: "LOG_MESSAGE",
+        level: level,
+        message: `${CS_LOG_PREFIX} ${message}`,
+        requestId: requestId || currentRequestId
+    });
+    // Also log locally
+    if (level === 'error') console.error(CS_LOG_PREFIX, message);
+    else if (level === 'warn') console.warn(CS_LOG_PREFIX, message);
+    else console.log(CS_LOG_PREFIX, message);
+}
+
 // Global state
 let provider = null; // This will be set by initializeContentRelay
 let setupComplete = false;
@@ -149,20 +163,30 @@ function initializeContentRelay() {
     
     // Setup message listeners (will be called later, once, via setupMessageListeners)
 
-    // If a provider is detected, proceed with provider-specific setup after a delay
+    // If a provider is detected, proceed with provider-specific setup
     if (provider) {
         console.log(CS_LOG_PREFIX, `Proceeding with provider-specific setup for: ${provider.name}`);
-        setTimeout(() => {
-            // Double check setupComplete flag in case of async issues or rapid calls, though less likely here.
-            if (!setupComplete) { 
-                findPotentialSelectors(); 
+        
+        // Use a provider-specific setup flag to ensure we only do this once per provider instance
+        if (!provider._chatRelaySetupInitiated) {
+            provider._chatRelaySetupInitiated = true;
+            
+            // Critical setup that can happen immediately (like attaching debugger)
+            findPotentialSelectors(); 
+
+            // Setup that might benefit from page being more "ready"
+            setTimeout(() => {
                 setupAutomaticResponseCapture(); 
                 startElementPolling(); 
-                console.log(CS_LOG_PREFIX, "Provider-specific DOM setup (response capture, polling) initiated after delay.");
-            }
-        }, 2000); // Delay to allow page elements to fully render
+                console.log(CS_LOG_PREFIX, `Secondary Provider-specific DOM setup for ${provider.name} initiated after delay.`);
+            }, 2000); // Delay to allow page elements to fully render
+        }
     } else {
-        console.warn(CS_LOG_PREFIX, "No provider detected. Some provider-specific features (response capture, element polling) will not be initialized.");
+        if (isFirstInitialization) {
+            console.log(CS_LOG_PREFIX, "No provider detected on initial load. Waiting for provider registration...");
+        } else {
+            console.warn(CS_LOG_PREFIX, "No provider detected. Some features will not be initialized.");
+        }
     }
     
     if (!setupComplete) {
@@ -172,31 +196,39 @@ function initializeContentRelay() {
     isFirstInitialization = false;
 }
 
+/// Safe querySelector helper that doesn't throw on invalid selectors
+function safeQuerySelector(selector) {
+    if (!selector) return null;
+    try {
+        // If it's a comma-separated list, try them one by one to avoid total failure
+        const parts = selector.split(',').map(p => p.trim());
+        for (const part of parts) {
+            try {
+                const element = document.querySelector(part);
+                if (element) return element;
+            } catch (e) {
+                // Silently ignore invalid individual selectors
+            }
+        }
+    } catch (e) {
+        console.warn(CS_LOG_PREFIX, "Error in safeQuerySelector:", e.message);
+    }
+    return null;
+}
+
 // Poll for elements that might be loaded dynamically
 function startElementPolling() {
-  if (!provider) {
-    console.warn(CS_LOG_PREFIX, "Cannot start element polling: no provider detected.");
-    return;
-  }
+  if (!provider) return;
   console.log(CS_LOG_PREFIX, "Starting element polling...");
   
-  // Check every 2 seconds for the input field and send button
   const pollingInterval = setInterval(() => {
-    if (!provider) { // Provider might have been lost or was never there
+    if (!provider) {
         clearInterval(pollingInterval);
-        console.warn(CS_LOG_PREFIX, "Stopping element polling: provider became unavailable.");
         return;
     }
-    const inputField = document.querySelector(provider.inputSelector);
-    const sendButton = document.querySelector(provider.sendButtonSelector);
     
-    if (inputField) {
-      console.log(CS_LOG_PREFIX, "Found input field:", inputField);
-    }
-    
-    if (sendButton) {
-      console.log(CS_LOG_PREFIX, "Found send button:", sendButton);
-    }
+    const inputField = safeQuerySelector(provider.inputSelector);
+    const sendButton = safeQuerySelector(provider.sendButtonSelector);
     
     if (inputField && sendButton) {
       console.log(CS_LOG_PREFIX, "Found all required elements, stopping polling");
@@ -206,85 +238,48 @@ function startElementPolling() {
 }
 
 // Function to send a message to the chat interface
-function sendChatMessage(text) {
+// This is the entry point for messages from the background script
+async function handleIncomingChatMessage(messageContent, message) {
+  const requestId = typeof message === 'object' ? message.requestId : message;
   if (!provider) {
     console.error(CS_LOG_PREFIX, "Cannot send chat message: No provider configured.");
-    processingMessage = false; // Reset flag
     return false;
   }
-  // Try to send the message with retries
-  return sendChatMessageWithRetry(text, 5); // Try up to 5 times
-}
+  
+  console.log(CS_LOG_PREFIX, `Processing incoming message for requestId: ${requestId}`);
+  processingMessage = true;
+  currentRequestId = requestId;
 
-// Helper function to send a message with retries
-function sendChatMessageWithRetry(text, maxRetries, currentRetry = 0) {
-  if (!provider) {
-    console.error(CS_LOG_PREFIX, `Cannot send chat message with retry (attempt ${currentRetry + 1}/${maxRetries}): No provider.`);
-    processingMessage = false;
-    return false;
-  }
   try {
-    const inputField = document.querySelector(provider.inputSelector);
-    if (!inputField) {
-      console.log(CS_LOG_PREFIX, `Could not find input field (attempt ${currentRetry + 1}/${maxRetries})`);
-      if (currentRetry < maxRetries - 1) {
-        console.log(CS_LOG_PREFIX, `Retrying in 1 second...`);
-        setTimeout(() => {
-          sendChatMessageWithRetry(text, maxRetries, currentRetry + 1);
-        }, 1000);
-        return true; 
+      // Initiate capture BEFORE sending the message to avoid race conditions
+      if (provider.initiateResponseCapture) {
+          console.log(CS_LOG_PREFIX, `Calling provider.initiateResponseCapture for requestId: ${requestId}`);
+          provider.initiateResponseCapture(requestId, handleProviderResponse);
       }
-      console.error(CS_LOG_PREFIX, "Could not find input field after all retries");
-      processingMessage = false; 
-      return false;
-    }
-    
-    const sendButton = document.querySelector(provider.sendButtonSelector);
-    if (!sendButton) {
-      console.log(CS_LOG_PREFIX, `Could not find send button (attempt ${currentRetry + 1}/${maxRetries})`);
-      if (currentRetry < maxRetries - 1) {
-        console.log(CS_LOG_PREFIX, `Retrying in 1 second...`);
-        setTimeout(() => {
-          sendChatMessageWithRetry(text, maxRetries, currentRetry + 1);
-        }, 1000);
-        return true; 
+      const success = await provider.sendChatMessage(messageContent, message);
+      if (success) {
+          console.log(CS_LOG_PREFIX, `Message sent successfully for requestId: ${requestId}`);
+          
+          if (provider.initiateResponseCapture) {
+              console.log(CS_LOG_PREFIX, `Provider has custom capture logic. Initiating...`);
+              provider.initiateResponseCapture(requestId, (id, text, isFinal) => {
+                  sendFinalResponseToRelay(id, text, isFinal);
+              });
+          } else if (provider.captureMethod !== "debugger") {
+              console.log(CS_LOG_PREFIX, `Provider uses ${provider.captureMethod} capture. Starting monitorResponseCompletion.`);
+              startMonitoringForResponse();
+          }
+      } else {
+          console.error(CS_LOG_PREFIX, `Provider failed to send message for requestId: ${requestId}`);
+          processingMessage = false;
+          currentRequestId = null;
       }
-      console.error(CS_LOG_PREFIX, "Could not find send button after all retries");
-      processingMessage = false; 
-      return false;
-    }
-    
-    const result = provider.sendChatMessage(text, inputField, sendButton);
-    
-    if (result) {
-        console.log(CS_LOG_PREFIX, "Message sent successfully via provider.");
-        if (provider.shouldSkipResponseMonitoring && provider.shouldSkipResponseMonitoring()) {
-            console.log(CS_LOG_PREFIX, `Provider ${provider.name} has requested to skip response monitoring.`);
-            processingMessage = false; // Message sent, no monitoring, so reset.
-        } else {
-            console.log(CS_LOG_PREFIX, `Waiting ${CAPTURE_DELAY/1000} seconds before starting to monitor for responses...`);
-            const timer = setTimeout(() => {
-                console.log(CS_LOG_PREFIX, "Starting to monitor for responses now");
-                startMonitoringForResponse();
-            }, CAPTURE_DELAY);
-            responseMonitoringTimers.push(timer);
-        }
-    } else {
-        console.error(CS_LOG_PREFIX, "Provider reported failure sending message.");
-        processingMessage = false; // Reset on failure
-    }
-    return result;
+      return success;
   } catch (error) {
-    console.error(CS_LOG_PREFIX, "Error sending message:", error);
-    if (currentRetry < maxRetries - 1) {
-      console.log(CS_LOG_PREFIX, `Error occurred, retrying in 1 second... (attempt ${currentRetry + 1}/${maxRetries})`);
-      setTimeout(() => {
-        sendChatMessageWithRetry(text, maxRetries, currentRetry + 1);
-      }, 1000);
-      return true; 
-    }
-    processingMessage = false; 
-    return false;
+      console.error(CS_LOG_PREFIX, `Error in handleIncomingChatMessage for requestId: ${requestId}:`, error);
+      processingMessage = false;
+      currentRequestId = null;
+      return false;
   }
 }
 
@@ -330,11 +325,26 @@ function startMonitoringForResponse() {
     captureAttempts++;
     console.log(CS_LOG_PREFIX, `Response capture attempt ${captureAttempts}/${MAX_CAPTURE_ATTEMPTS}`);
 
-    const responseElement = document.querySelector(provider.responseSelector);
-    if (responseElement) {
-      const responseText = provider.getResponseText(responseElement);
-      const isFinal = provider.isResponseComplete ? provider.isResponseComplete(responseElement) : false; // Default to false if not implemented
+    let responseText = "";
+    let isFinal = false;
 
+    // USE PROVIDER'S CAPTURE METHOD IF AVAILABLE (Important for Shadow DOM support like Gemini)
+    if (typeof provider.captureResponse === 'function') {
+      const captureResult = provider.captureResponse();
+      if (captureResult && captureResult.found) {
+        responseText = captureResult.text;
+        isFinal = captureResult.isStillGenerating === false;
+      }
+    } else {
+      // Fallback to legacy selection
+      const responseElement = document.querySelector(provider.responseSelector);
+      if (responseElement) {
+        responseText = provider.getResponseText(responseElement);
+        isFinal = provider.isResponseComplete ? provider.isResponseComplete(responseElement) : false;
+      }
+    }
+
+    if (responseText || isFinal) {
       console.log(CS_LOG_PREFIX, `Captured response text (length: ${responseText.length}), isFinal: ${isFinal}`);
       
       // Send to background
@@ -373,8 +383,15 @@ function startMonitoringForResponse() {
 
 // Function to set up automatic response capture using MutationObserver
 function setupAutomaticResponseCapture() {
-  if (!provider || !provider.responseContainerSelector || typeof provider.handleMutation !== 'function') {
-    console.warn(CS_LOG_PREFIX, "Cannot set up automatic response capture: Provider or necessary provider methods/selectors are not configured.");
+  if (!provider) return;
+  
+  if (!provider.responseContainerSelector || typeof provider.handleMutation !== 'function') {
+    if (provider.initiateResponseCapture) {
+        // Provider handles its own capture (e.g. ChatGPT with debugger/fallback)
+        console.log(CS_LOG_PREFIX, `Provider ${provider.name} handles its own response capture. Skipping standard MutationObserver setup.`);
+        return;
+    }
+    console.warn(CS_LOG_PREFIX, "Cannot set up standard automatic response capture: Provider or necessary provider methods/selectors are not configured.");
     return;
   }
 
@@ -708,45 +725,26 @@ function setupMessageListeners() { // Renamed from setupAutomaticMessageSending
       currentRequestId = message.requestId;
       console.log(CS_LOG_PREFIX, `Set currentRequestId to ${currentRequestId} for processing.`);
 
-      if (provider && typeof provider.sendChatMessage === 'function') {
-        provider.sendChatMessage(messageContent, currentRequestId) // Pass messageContent and the requestId
-          .then(success => {
-            if (success) {
-              console.log(CS_LOG_PREFIX, `Message sending initiated successfully via provider for requestId: ${currentRequestId}.`);
-              if (provider.initiateResponseCapture && typeof provider.initiateResponseCapture === 'function') {
-                console.log(CS_LOG_PREFIX, `Calling provider.initiateResponseCapture for requestId: ${currentRequestId}`);
-                provider.initiateResponseCapture(currentRequestId, handleProviderResponse);
-              } else {
-                console.error(CS_LOG_PREFIX, `Provider ${provider.name} does not have initiateResponseCapture method. Response will not be processed for requestId ${currentRequestId}.`);
-                // If no response capture, this request might hang on the server side.
-                // Consider sending an error back to background.js or directly to server.
-                 chrome.runtime.sendMessage({
-                    type: "FINAL_RESPONSE_TO_RELAY",
-                    requestId: currentRequestId,
-                    error: `Provider ${provider.name} cannot capture responses. Message sent but no response will be relayed.`,
-                    isFinal: true
-                });
-                processingMessage = false; // As we can't process response
-                currentRequestId = null;
-              }
-              sendResponse({ success: true, message: "Message sending initiated by provider." });
-            } else {
-              console.error(CS_LOG_PREFIX, `Provider failed to initiate sending message for requestId: ${currentRequestId}.`);
-              processingMessage = false;
-              currentRequestId = null;
-              sendResponse({ success: false, error: "Provider failed to send message." });
-            }
-          }).catch(error => {
-            console.error(CS_LOG_PREFIX, `Error during provider.sendChatMessage for requestId: ${currentRequestId}:`, error);
-            processingMessage = false;
-            currentRequestId = null;
-            sendResponse({ success: false, error: `Error sending message: ${error.message}` });
-          });
+      // Use the new handleIncomingChatMessage entry point
+      if (provider && typeof handleIncomingChatMessage === 'function') {
+          handleIncomingChatMessage(messageContent, message)
+              .then(success => {
+                if (success) {
+                  console.log(CS_LOG_PREFIX, `Message processing started successfully for requestId: ${message.requestId}.`);
+                  sendResponse({ success: true, message: "Message processing started." });
+                } else {
+                  console.error(CS_LOG_PREFIX, `Failed to process message for requestId: ${message.requestId}.`);
+                  sendResponse({ success: false, error: "Failed to process message." });
+                }
+              }).catch(error => {
+                console.error(CS_LOG_PREFIX, `Error handling message for requestId: ${message.requestId}:`, error);
+                sendResponse({ success: false, error: `Error: ${error.message}` });
+              });
       } else {
-        console.error(CS_LOG_PREFIX, "Provider or provider.sendChatMessage is not available for requestId:", message.requestId);
+        console.error(CS_LOG_PREFIX, "Provider or handleIncomingChatMessage is not available for requestId:", message.requestId);
         processingMessage = false;
-        currentRequestId = null; // Ensure reset if it was about to be set
-        sendResponse({ success: false, error: "Provider or sendChatMessage method missing." });
+        currentRequestId = null;
+        sendResponse({ success: false, error: "Provider or handleIncomingChatMessage missing." });
       }
       return true; // Indicate async response
     } else if (message.type === "DEBUGGER_RESPONSE" || message.type === "PROVIDER_DEBUGGER_EVENT") {
