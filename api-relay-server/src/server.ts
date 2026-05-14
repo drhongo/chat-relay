@@ -751,8 +751,8 @@ async function handlePortConflict(portToFree: number, autoKillEnabled: boolean) 
     let pid: string | null = null;
 
     if (isWindows) {
-      // Use full path to netstat if possible, or just netstat.exe to be more explicit
-      const command = `netstat.exe -ano -p TCP | findstr ":${portToFree}.*LISTENING"`;
+      // Use absolute path to netstat to ensure it works even if not in PATH
+      const command = `C:\\Windows\\System32\\netstat.exe -ano -p TCP | findstr ":${portToFree}.*LISTENING"`;
       try {
         const output = execSync(command, { encoding: 'utf-8' });
         if (output) {
