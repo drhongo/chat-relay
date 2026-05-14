@@ -214,12 +214,19 @@ class ChatGptProvider {
     
     if (this.captureMethod === "debugger") {
       console.log(`[${this.name}] Debugger capture initiated. Requesting debugger attachment.`);
+
+      // Use specific patterns instead of the broad one to avoid intercepting all site traffic
+      const patterns = this.getStreamingApiPatterns();
+      if (patterns.length === 0) {
+          patterns.push({ urlPattern: this.debuggerUrlPattern });
+      }
+
       chrome.runtime.sendMessage({
           type: "SET_DEBUGGER_TARGETS",
           providerName: this.name,
-          patterns: [{ urlPattern: this.debuggerUrlPattern }]
+          patterns: patterns
       });
-      console.log(`[${this.name}] Debugger capture initiated. Setting DOM fallback timer for ${this.domFallbackTimeout}ms.`);
+      console.log(`[${this.name}] Debugger capture initiated with ${patterns.length} patterns. Setting DOM fallback timer for ${this.domFallbackTimeout}ms.`);
       
       // Clear any existing fallback timer
       if (this.domFallbackTimer) clearTimeout(this.domFallbackTimer);
