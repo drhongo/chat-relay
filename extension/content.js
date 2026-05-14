@@ -263,7 +263,7 @@ async function handleIncomingChatMessage(messageContent, message) {
           if (provider.initiateResponseCapture) {
               console.log(CS_LOG_PREFIX, `Provider has custom capture logic. Initiating...`);
               provider.initiateResponseCapture(requestId, (id, text, isFinal) => {
-                  sendFinalResponseToRelay(id, text, isFinal);
+                  handleProviderResponse(id, text, isFinal);
               });
           } else if (provider.captureMethod !== "debugger") {
               console.log(CS_LOG_PREFIX, `Provider uses ${provider.captureMethod} capture. Starting monitorResponseCompletion.`);
