@@ -664,15 +664,32 @@ class ChatGptProvider {
 
   _captureResponseDOM(element = null) {
     if (!element) {
-        const elements = document.querySelectorAll(this.responseSelector);
-        if (elements.length > 0) {
-            element = elements[elements.length - 1];
+        // Broaden search to ensure we get the latest assistant message specifically
+        const assistantMessages = document.querySelectorAll('[data-message-author-role="assistant"]');
+        if (assistantMessages.length > 0) {
+            // Pick the latest one
+            const lastAssistantMessage = assistantMessages[assistantMessages.length - 1];
+            // Look for the markdown container inside it
+            element = lastAssistantMessage.querySelector('div.markdown') || lastAssistantMessage;
+        } else {
+            // Fallback to general response selectors
+            const elements = document.querySelectorAll(this.responseSelector);
+            if (elements.length > 0) {
+                element = elements[elements.length - 1];
+            }
         }
     }
     if (!element) {
         return { text: null, isStillGenerating: false };
     }
+
     let responseText = element.innerText || element.textContent || "";
+
+    // Log for debugging mismatch
+    if (responseText.length > 0) {
+        console.log(`[${this.name}] DOM capture found text length: ${responseText.length}. Sample: "${responseText.substring(0, 30)}..."`);
+    }
+
     if (this.lastSentMessage && responseText.trim().startsWith(this.lastSentMessage.trim())) {
         const potentialActualResponse = responseText.substring(this.lastSentMessage.length).trim();
         if (potentialActualResponse === "") {
