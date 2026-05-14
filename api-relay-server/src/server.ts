@@ -119,6 +119,7 @@ interface WebSocketMessage {
   response?: string;
   chunk?: string;
   isFinal?: boolean;
+  encoded?: boolean;
   error?: string;
   settings?: {
     model?: string;
@@ -421,8 +422,16 @@ wss.on('connection', (ws: WebSocket) => {
       } else if (data.type === 'CHAT_RESPONSE') {
         const pendingRequest = pendingRequests.get(data.requestId!);
         if (pendingRequest) {
+          let responseText = data.response;
+          if (data.encoded && responseText) {
+            try {
+              responseText = decodeURIComponent(responseText);
+            } catch (e) {
+              console.warn(`SERVER.TS: Failed to decode CHAT_RESPONSE for requestId: ${data.requestId}`);
+            }
+          }
           // Buffer the response
-          pendingRequest.accumulatedResponse = data.response;
+          pendingRequest.accumulatedResponse = responseText;
           
           if (data.isFinal === true) {
             responseDataToUse = pendingRequest.accumulatedResponse;
