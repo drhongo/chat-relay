@@ -318,10 +318,11 @@ chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
     const text = message.response || message.text || message.chunk;
     if (relaySocket && relaySocket.readyState === WebSocket.OPEN) {
       relaySocket.send(JSON.stringify({
-        type: "CHAT_RESPONSE", 
-        requestId: message.requestId, 
+        type: "CHAT_RESPONSE",
+        requestId: message.requestId,
         response: text,
-        isFinal: message.isFinal !== undefined ? message.isFinal : true 
+        isFinal: message.isFinal !== undefined ? message.isFinal : true,
+        encoded: message.encoded === true
       }));
       sendResponse({ success: true });
       if (lastRequestId === message.requestId && (message.isFinal || message.isFinal === undefined)) {
