@@ -739,7 +739,7 @@ app.get('/health', (req: Request, res: Response) => {
 });
 
 // Function to handle port conflicts by killing processes using the port
-function handlePortConflict(portToFree: number, autoKillEnabled: boolean) {
+async function handlePortConflict(portToFree: number, autoKillEnabled: boolean) {
   if (!autoKillEnabled) {
     console.log(`Auto-kill is disabled. Skipping port conflict check for port ${portToFree}.`);
     return;
@@ -751,7 +751,8 @@ function handlePortConflict(portToFree: number, autoKillEnabled: boolean) {
     let pid: string | null = null;
 
     if (isWindows) {
-      const command = `netstat -ano -p TCP | findstr ":${portToFree}.*LISTENING"`;
+      // Use full path to netstat if possible, or just netstat.exe to be more explicit
+      const command = `netstat.exe -ano -p TCP | findstr ":${portToFree}.*LISTENING"`;
       try {
         const output = execSync(command, { encoding: 'utf-8' });
         if (output) {
@@ -783,9 +784,10 @@ function handlePortConflict(portToFree: number, autoKillEnabled: boolean) {
           execSync(`kill -9 ${pid}`);
         }
         console.log(`Successfully killed process ${pid} using port ${portToFree}. Waiting 1s for port to release...`);
-        // Add a small delay to allow the OS to release the port
-        execSync(isWindows ? 'timeout /t 1 /nobreak' : 'sleep 1');
-        
+
+        // Cross-platform async delay
+        await new Promise(resolve => setTimeout(resolve, 1000));
+
         logAdminMessage('PORT_KILLED', `PORT_${portToFree}`, { port: portToFree, pid: pid, status: 'success' })
           .catch(err => console.error("ADMIN_LOG_ERROR (PORT_KILLED):", err));
       } catch (killError) {
@@ -804,7 +806,7 @@ function handlePortConflict(portToFree: number, autoKillEnabled: boolean) {
 // Start the server
 async function startServer() {
   // Handle potential port conflict before starting the server
-  handlePortConflict(serverPortForListen, autoKillPort);
+  await handlePortConflict(serverPortForListen, autoKillPort);
 
   server.listen(serverPortForListen, () => {
     console.log(`SERVER.TS: OpenAI-compatible relay server started and listening on port ${serverPortForListen}`);
