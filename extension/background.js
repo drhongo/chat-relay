@@ -415,11 +415,14 @@ async function attachDebuggerAndEnableFetch(tabId, providerName, patterns) {
         console.log(`[BG DEBUGGER] Enabling Fetch and Network for tab ${tabId} with patterns...`);
         await new Promise((resolve, reject) => {
             chrome.debugger.sendCommand(debuggee, "Network.enable", {}, () => {
+                if (chrome.runtime.lastError) {
+                    console.warn(`[BG DEBUGGER] Network.enable failed for tab ${tabId}:`, chrome.runtime.lastError.message);
+                }
                 chrome.debugger.sendCommand(debuggee, "Fetch.enable", {
                     patterns: patterns.map(p => ({ urlPattern: p.urlPattern, requestStage: "Response" }))
                 }, () => {
                     if (chrome.runtime.lastError) {
-                        console.error(`[BG DEBUGGER] Enable failed for tab ${tabId}:`, chrome.runtime.lastError.message);
+                        console.error(`[BG DEBUGGER] Fetch.enable failed for tab ${tabId}:`, chrome.runtime.lastError.message);
                         return reject(chrome.runtime.lastError);
                     }
                     console.log(`[BG DEBUGGER] Debugger domains enabled SUCCESS for tab ${tabId}.`);
@@ -464,7 +467,8 @@ chrome.debugger.onEvent.addListener((debuggeeId, message, params) => {
         : lastRequestId;
 
     if (message === "Fetch.requestPaused") {
-        console.log(`[BG DEBUGGER] Request paused in tab ${tabId}: ${params.request.url} (Status: ${params.responseStatusCode || 'N/A'})`);
+        const url = params.request.url;
+        console.log(`[BG DEBUGGER] Request paused in tab ${tabId}: ${url} (Status: ${params.responseStatusCode || 'N/A'})`);
 
         if (!tabInfo || !tabInfo.isFetchEnabled || currentOperationRequestId === null) {
             chrome.debugger.sendCommand(debuggeeId, "Fetch.continueRequest", { requestId: params.requestId });
@@ -473,7 +477,7 @@ chrome.debugger.onEvent.addListener((debuggeeId, message, params) => {
 
         const matchesPattern = tabInfo.patterns.some(p => {
             const patternRegex = new RegExp(String(p.urlPattern).replace(/[.*+?^${}()|[\]\\]/g, '\\$&').replace(/\\\*/g, '.*?'));
-            return patternRegex.test(params.request.url);
+            return patternRegex.test(url);
         });
 
         if (!matchesPattern) {
@@ -481,24 +485,33 @@ chrome.debugger.onEvent.addListener((debuggeeId, message, params) => {
             return;
         }
 
-        console.log(`[BG DEBUGGER] Matching request found: ${params.request.url}. Continuing immediately to avoid blocking stream.`);
+        sendRemoteLog('info', `Debugger matched request for ${tabInfo.providerName}: ${url.substring(0, 100)}...`, currentOperationRequestId);
+        console.log(`[BG DEBUGGER] Matching request found: ${url}. Continuing immediately to avoid blocking stream.`);
         // Continue immediately so the UI remains responsive and streaming works
         chrome.debugger.sendCommand(debuggeeId, "Fetch.continueRequest", { requestId: params.requestId });
-
-        // We will capture the data via Network.loadingFinished or Network.eventSourceMessageReceived
     }
 
     if (message === "Network.eventSourceMessageReceived") {
         console.log(`[BG DEBUGGER] SSE Message in tab ${tabId} for request ${params.requestId}`);
         // This gives us real-time chunks for SSE!
-        chrome.tabs.sendMessage(tabId, {
-            type: "PROVIDER_DEBUGGER_EVENT",
-            detail: {
-                requestId: currentOperationRequestId,
-                networkRequestId: params.requestId,
-                data: `data: ${params.data}\n\n`, // Re-wrap in data: prefix for the provider's parser
-                isFinal: false
+        chrome.tabs.get(tabId, (tab) => {
+            if (chrome.runtime.lastError || !tab) {
+                console.warn(`[BG DEBUGGER] Cannot send SSE message, tab ${tabId} no longer exists.`);
+                return;
             }
+            chrome.tabs.sendMessage(tabId, {
+                type: "PROVIDER_DEBUGGER_EVENT",
+                detail: {
+                    requestId: currentOperationRequestId,
+                    networkRequestId: params.requestId,
+                    data: `data: ${params.data}\n\n`, // Re-wrap in data: prefix for the provider's parser
+                    isFinal: false
+                }
+            }, () => {
+                if (chrome.runtime.lastError) {
+                    // Ignore "No tab with given id" or "Receiving end does not exist"
+                }
+            });
         });
     }
 
@@ -524,9 +537,16 @@ chrome.debugger.onEvent.addListener((debuggeeId, message, params) => {
             }
 
             if (processedData) {
-                chrome.tabs.sendMessage(tabId, {
-                    type: "PROVIDER_DEBUGGER_EVENT",
-                    detail: { requestId: currentOperationRequestId, networkRequestId: params.requestId, data: processedData, isFinal: true }
+                chrome.tabs.get(tabId, (tab) => {
+                    if (chrome.runtime.lastError || !tab) return;
+                    chrome.tabs.sendMessage(tabId, {
+                        type: "PROVIDER_DEBUGGER_EVENT",
+                        detail: { requestId: currentOperationRequestId, networkRequestId: params.requestId, data: processedData, isFinal: true }
+                    }, () => {
+                        if (chrome.runtime.lastError) {
+                            // Ignore
+                        }
+                    });
                 });
             }
         });

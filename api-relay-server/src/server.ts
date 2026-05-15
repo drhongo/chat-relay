@@ -670,11 +670,19 @@ apiRouter.post('/chat/completions', async (req: Request, res: Response): Promise
   }
 
   // Smart Session Management for IDE Agents (Continue, Cursor, etc.)
-  // 1. If messages.length is 1, it's the start of a new thread -> Use New Chat.
-  // 2. If messages.length > 1, it's a follow-up -> Stay in the current thread.
-  // 3. User can still override this manually with the 'new_chat' flag in the body.
+  // 1. If messages.length is 1, it's a new prompt -> Start a fresh chat.
+  // 2. If messages.length > 1, it's likely a conversation with history -> Stay in current thread to be fast.
+  // 3. User can explicitly control this with "new_chat": true/false in the request body.
+  // 4. IMPORTANT: If history (messages.length > 1) is provided, but it doesn't match the actual
+  //    history in the browser tab, the AI will only see the browser tab's context.
   const isNewConversation = messages.length === 1;
   const effectiveNewChat = new_chat !== undefined ? new_chat : isNewConversation;
+
+  if (effectiveNewChat) {
+    console.log(`SERVER.TS: Request ${requestId} identified as a NEW conversation (effectiveNewChat=true).`);
+  } else {
+    console.log(`SERVER.TS: Request ${requestId} identified as a FOLLOW-UP (effectiveNewChat=false).`);
+  }
 
   // Acknowledge stream, but don't implement it yet to keep the fix simple.
   if (stream) {

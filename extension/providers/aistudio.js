@@ -145,8 +145,20 @@ class AIStudioProvider {
   }
 
   // Send a message to the chat interface
-  async sendChatMessage(messageContent) {
-    console.log(`[${this.name}] sendChatMessage called with content type:`, typeof messageContent, Array.isArray(messageContent) ? `Array length: ${messageContent.length}` : '');
+  async sendChatMessage(messageContent, messageOrId) {
+    const requestId = typeof messageOrId === 'object' ? messageOrId.requestId : messageOrId;
+    console.log(`[${this.name}] sendChatMessage called for requestId ${requestId}`);
+
+    // Handle New Chat request
+    if (typeof messageOrId === 'object' && messageOrId.settings && messageOrId.settings.new_chat) {
+        console.log(`[${this.name}] New Chat requested. Clicking New Chat button.`);
+        const newChatButton = document.querySelector('a[href="/prompts/new"], button[aria-label="New prompt"]');
+        if (newChatButton) {
+            newChatButton.click();
+            await new Promise(resolve => setTimeout(resolve, 2000));
+        }
+    }
+
     const inputField = document.querySelector(this.inputSelector);
     const sendButton = document.querySelector(this.sendButtonSelector);
 
@@ -295,7 +307,7 @@ class AIStudioProvider {
     console.log(`[${this.name}] handleDebuggerData called for requestId: ${requestId}. Raw data length: ${rawData ? rawData.length : 'null'}. isFinalFromBackground: ${isFinalFromBackground}`);
     const callback = this.pendingResponseCallbacks.get(requestId);
     if (!callback) {
-      console.warn(`[${this.name}] No pending callback found for debugger data with requestId: ${requestId}. Ignoring.`);
+      // console.debug(`[${this.name}] No pending callback found for debugger data with requestId: ${requestId}.`);
       return;
     }
 

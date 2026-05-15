@@ -23,8 +23,8 @@ class GeminiProvider {
     this.supportedDomains = ['gemini.google.com'];
 
     // --- START OF CONFIGURABLE PROPERTIES ---
-    this.captureMethod = "dom"; 
-    this.debuggerUrlPattern = "*://gemini.google.com/*"; 
+    this.captureMethod = "dom"; // Reverting to DOM as primary for stability
+    this.debuggerUrlPattern = "*://gemini.google.com/*";
     this.includeThinkingInMessage = false;
     // --- END OF CONFIGURABLE PROPERTIES ---
 
@@ -38,9 +38,19 @@ class GeminiProvider {
     this.lastSentMessage = '';
     this.pendingResponseCallbacks = new Map();
     this.requestAccumulators = new Map();
-    this.domFallbackTimeout = 8000;
+    this.domFallbackTimeout = 12000;
     this.domFallbackTimer = null;
     this.domMonitorTimer = null;
+
+    this._loadSettings();
+    console.log(`[${this.name}] Provider initialized.`);
+  }
+
+  _loadSettings() {
+    chrome.storage.sync.get({ geminiCaptureMethod: 'dom' }, (items) => {
+      this.captureMethod = items.geminiCaptureMethod;
+      console.log(`[${this.name}] Capture method updated to: ${this.captureMethod}`);
+    });
   }
 
   // Send a message to the chat interface
@@ -61,13 +71,23 @@ class GeminiProvider {
 
       // Handle New Chat request
       if (typeof messageOrId === 'object' && messageOrId.settings && messageOrId.settings.new_chat) {
-          if (window.location.pathname !== "/app") {
-            console.log(`[${this.name}] New Chat requested. Clicking New Chat button.`);
-            const newChatButton = document.querySelector(this.newChatSelector);
-            if (newChatButton) {
-                newChatButton.click();
-                await new Promise(resolve => setTimeout(resolve, 3000));
-            }
+          // Robust check for New Chat - if we are not on the main /app page, or even if we are (to clear draft)
+          console.log(`[${this.name}] New Chat requested. Clicking New Chat button.`);
+          const newChatButton = document.querySelector(this.newChatSelector);
+          if (newChatButton) {
+              const rect = newChatButton.getBoundingClientRect();
+              const clientX = rect.left + rect.width / 2;
+              const clientY = rect.top + rect.height / 2;
+
+              newChatButton.dispatchEvent(new PointerEvent('pointerdown', { bubbles: true, pointerType: 'mouse', clientX, clientY }));
+              newChatButton.dispatchEvent(new MouseEvent('mousedown', { bubbles: true, clientX, clientY }));
+              newChatButton.click();
+              newChatButton.dispatchEvent(new PointerEvent('pointerup', { bubbles: true, pointerType: 'mouse', clientX, clientY }));
+              newChatButton.dispatchEvent(new MouseEvent('mouseup', { bubbles: true, clientX, clientY }));
+
+              await new Promise(resolve => setTimeout(resolve, 3000));
+          } else {
+              console.warn(`[${this.name}] New Chat button not found, continuing with current chat.`);
           }
       }
 
@@ -178,13 +198,19 @@ class GeminiProvider {
         
         if (currentText && currentText !== lastCapturedText) {
             lastCapturedText = currentText;
-            noChangeStreak = 0; 
-            callback(requestId, currentText, false); 
-        } else if (currentText && currentText === lastCapturedText && currentText !== "") {
+            noChangeStreak = 0;
+            callback(requestId, currentText, false);
+        } else if (currentText === lastCapturedText) {
             noChangeStreak++;
         }
-        
-        if (!isStillGenerating && noChangeStreak >= 3 && lastCapturedText.trim() !== "") {
+
+        if (!isStillGenerating && noChangeStreak >= 5 && lastCapturedText.trim() !== "") {
+            isFinalDOMResponse = true;
+        }
+
+        // If we've been waiting for 10 seconds and have NO text and NO generating signal, assume something is wrong and finish
+        if (!isStillGenerating && noChangeStreak >= 20 && lastCapturedText.trim() === "") {
+            console.log(`[${this.name}] No text found after 10s of polling and no generating signal. Finishing.`);
             isFinalDOMResponse = true;
         }
         
@@ -224,24 +250,51 @@ class GeminiProvider {
 
     // Try primary and fallback selectors with shadow piercing
     let responseElements = findDeep(document, this.responseSelector);
+
+    // Filter out elements that are likely part of the "Welcome/Home" screen chips
+    responseElements = responseElements.filter(el => {
+        const text = el.innerText || "";
+        // Gemini welcome screen often contains these strings
+        if (text.includes("Create image") || text.includes("Help me learn") || text.includes("Boost my day") || text.includes("Create music")) {
+            return false;
+        }
+        return true;
+    });
+
     console.log(`[${this.name}] Primary search found ${responseElements.length} elements.`);
 
     if (responseElements.length === 0) {
         responseElements = findDeep(document, 'message-content, .model-response-text, .markdown, .response-container');
+        // Apply same filter
+        responseElements = responseElements.filter(el => {
+            const text = el.innerText || "";
+            return !(text.includes("Create image") || text.includes("Help me learn") || text.includes("Boost my day") || text.includes("Create music"));
+        });
         console.log(`[${this.name}] Fallback search found ${responseElements.length} elements.`);
     }
-    
-    // Final desperate search
+
+    // Final desperate search - only if we didn't find anything and we are SURE we're not on the home page suggestions
     if (responseElements.length === 0) {
         responseElements = findDeep(document, 'div').filter(el => {
             const text = el.innerText || "";
-            return text.length > 50 && !el.querySelector('textarea') && !el.closest('sidebar, .sidebar');
+            const isHomeSuggestion = text.includes("Create image") || text.includes("Help me learn") || text.includes("Boost my day") || text.includes("Create music");
+            // Also filter out standard UI labels
+            const isUILabel = text.trim() === "Gemini" || text.trim() === "Enter a prompt here";
+
+            return text.length > 50 && !isHomeSuggestion && !isUILabel && !el.querySelector('textarea') && !el.closest('sidebar, .sidebar');
         });
         console.log(`[${this.name}] Desperate search found ${responseElements.length} elements.`);
     }
 
     const lastResponse = responseElements[responseElements.length - 1];
-    const text = lastResponse ? (lastResponse.innerText || lastResponse.textContent || "").trim() : "";
+    let text = lastResponse ? (lastResponse.innerText || lastResponse.textContent || "").trim() : "";
+
+    // Safety check: if text exactly matches the prompt, it might be the user message echoing back
+    if (this.lastSentMessage && text === this.lastSentMessage.trim()) {
+        console.log(`[${this.name}] Extracted text matches last sent message. Skipping.`);
+        text = "";
+    }
+
     console.log(`[${this.name}] Extracted text length: ${text.length}. Sample: "${text.substring(0, 50)}..."`);
     
     // Check for thinking indicator
@@ -276,22 +329,173 @@ class GeminiProvider {
   }
 
   async initiateResponseCapture(requestId, responseCallback) {
-    console.log(`[${this.name}] initiateResponseCapture called for requestId: ${requestId}`);
+    console.log(`[${this.name}] initiateResponseCapture called for requestId: ${requestId}. Capture method: ${this.captureMethod}`);
     this.pendingResponseCallbacks.set(requestId, responseCallback);
-    this._startDOMMonitoring(requestId);
+
+    // Reset accumulator for this request
+    this.requestAccumulators.set(requestId, { text: "", isDefinitelyFinal: false });
+
+    if (this.captureMethod === "debugger") {
+      console.log(`[${this.name}] Debugger capture initiated. Requesting debugger attachment.`);
+
+      const patterns = this.getStreamingApiPatterns();
+      await new Promise(resolve => {
+        chrome.runtime.sendMessage({
+            type: "SET_DEBUGGER_TARGETS",
+            providerName: this.name,
+            patterns: patterns
+        }, response => {
+            console.log(`[${this.name}] SET_DEBUGGER_TARGETS response:`, response);
+            resolve();
+        });
+      });
+
+      // Clear any existing fallback timer
+      if (this.domFallbackTimer) clearTimeout(this.domFallbackTimer);
+
+      this.domFallbackTimer = setTimeout(() => {
+        const acc = this.requestAccumulators.get(requestId);
+        if (acc && acc.text.length === 0) {
+          console.warn(`[${this.name}] No data received via debugger after ${this.domFallbackTimeout}ms. Falling back to DOM capture.`);
+          this._startDOMMonitoring(requestId);
+        }
+      }, this.domFallbackTimeout);
+    } else {
+      this._startDOMMonitoring(requestId);
+    }
   }
 
-  async handleDebuggerData(requestId, rawData, isFinalFromBackground) {
-    // Standard interface but Gemini uses DOM capture primarily now
-    this._startDOMMonitoring(requestId);
+  handleDebuggerData(requestId, rawData, isFinalFromBackground) {
+    const callback = this.pendingResponseCallbacks.get(requestId);
+    if (!callback) return;
+
+    let accumulator = this.requestAccumulators.get(requestId);
+    if (!accumulator) {
+      accumulator = { text: "", isDefinitelyFinal: false };
+      this.requestAccumulators.set(requestId, accumulator);
+    }
+
+    if (accumulator.isDefinitelyFinal) return;
+
+    if (rawData && rawData.trim() !== "") {
+        const parseOutput = this.parseDebuggerResponse(rawData);
+
+        if (accumulator.text.length === 0 && parseOutput.text) {
+          console.log(`[${this.name}] First debugger data received for ${requestId}. Disabling DOM fallback timer.`);
+          if (this.domFallbackTimer) {
+              clearTimeout(this.domFallbackTimer);
+              this.domFallbackTimer = null;
+          }
+        }
+
+        if (parseOutput.text !== null) {
+            accumulator.text = parseOutput.text;
+        }
+
+        if (parseOutput.isFinalResponse) {
+            accumulator.isDefinitelyFinal = true;
+        }
+
+        if (parseOutput.text !== null || accumulator.isDefinitelyFinal) {
+          callback(requestId, accumulator.text, accumulator.isDefinitelyFinal);
+        }
+    } else if (isFinalFromBackground && !accumulator.isDefinitelyFinal) {
+        accumulator.isDefinitelyFinal = true;
+        callback(requestId, accumulator.text, true);
+    }
+
+    if (accumulator.isDefinitelyFinal) {
+      this.pendingResponseCallbacks.delete(requestId);
+      this.requestAccumulators.delete(requestId);
+    }
   }
 
   parseDebuggerResponse(rawDataString) {
-    return { text: "", isFinalResponse: false };
+    let text = null;
+    let isFinalResponse = false;
+
+    if (!rawDataString) return { text, isFinalResponse };
+
+    try {
+        // Gemini often returns chunks that are arrays like [["something", ...]]
+        // or multiple such arrays separated by newlines or numbers (length prefixes).
+
+        // Strategy: find all JSON-like array structures and extract the longest string
+        // which is almost always the actual response content.
+
+        const chunks = rawDataString.split("\n");
+        let bestText = "";
+
+        for (const chunk of chunks) {
+            if (!chunk.trim()) continue;
+
+            // Try to find array patterns
+            const matches = chunk.match(/\[[\s\S]*\]/g);
+            if (matches) {
+                for (const match of matches) {
+                    try {
+                        const parsed = JSON.parse(match);
+                        // Recursively search for the longest string in the parsed object
+                        const findLongestString = (obj) => {
+                            let longest = "";
+                            if (typeof obj === 'string') return obj;
+                            if (Array.isArray(obj)) {
+                                obj.forEach(item => {
+                                    const s = findLongestString(item);
+                                    if (s.length > longest.length) longest = s;
+                                });
+                            } else if (typeof obj === 'object' && obj !== null) {
+                                Object.values(obj).forEach(val => {
+                                    const s = findLongestString(val);
+                                    if (s.length > longest.length) longest = s;
+                                });
+                            }
+                            return longest;
+                        };
+
+                        const candidate = findLongestString(parsed);
+                        if (candidate.length > bestText.length) {
+                            bestText = candidate;
+                        }
+                    } catch (e) {
+                        // Not valid JSON array, skip
+                    }
+                }
+            }
+        }
+
+        if (bestText.length > 0) {
+            text = bestText;
+        }
+
+        // Gemini completion indicators
+        if (rawDataString.includes("xsrf_token") || rawDataString.includes("finish_reason")) {
+            // isFinalResponse = true;
+        }
+    } catch (e) {
+        console.warn(`[${this.name}] Error parsing debugger response:`, e);
+    }
+
+    return { text, isFinalResponse };
   }
 
   getStreamingApiPatterns() {
-    return [];
+    return [
+      { urlPattern: "*://gemini.google.com/_/BardChatUi/data/assistant.v1.BardAssistant/StreamGenerate*", requestStage: "Response" },
+      { urlPattern: "*://gemini.google.com/app/v1/chat*", requestStage: "Response" }
+    ];
+  }
+
+  stopStreaming(requestId) {
+    console.log(`[${this.name}] stopStreaming called for ${requestId}`);
+    const callback = this.pendingResponseCallbacks.get(requestId);
+    if (callback) {
+      const acc = this.requestAccumulators.get(requestId);
+      callback(requestId, (acc ? acc.text : "") + "[STREAM_STOPPED_BY_USER]", true);
+    }
+    this.pendingResponseCallbacks.delete(requestId);
+    this.requestAccumulators.delete(requestId);
+    this._stopDOMMonitoring();
   }
 
   findResponseElement(container) {

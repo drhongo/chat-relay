@@ -32,7 +32,7 @@ class ChatGptProvider {
     this.thinkingIndicatorSelector = '.loading-spinner, [data-testid="stop-button"], .typing-indicator';
     this.responseSelectorForDOMFallback = '[data-message-author-role="assistant"] div.markdown';
     this.thinkingIndicatorSelectorForDOM = '.loading-spinner, .blue-circle';
-    this.newChatSelector = '[data-testid="sidebar-new-chat-button"], nav a[href="/"], .new-chat-button';
+    this.newChatSelector = 'a[data-testid="sidebar-new-chat-button"], button[data-testid="sidebar-new-chat-button"], nav a[href="/"], .new-chat-button, button[aria-label="New chat" i], [aria-label="New chat" i], button[aria-label*="New chat" i], a[aria-label*="New chat" i], [data-testid$="new-chat-button"]';
     this.lastSentMessage = '';
     this.pendingResponseCallbacks = new Map();
     this.requestAccumulators = new Map();
@@ -75,26 +75,56 @@ class ChatGptProvider {
 
       // Handle New Chat request
       if (typeof messageOrId === 'object' && messageOrId.settings && messageOrId.settings.new_chat) {
-          // If we are already on the root / chat page, we might not need to click new chat
-          if (window.location.pathname !== "/" && window.location.pathname !== "/chat") {
-            console.log(`[${this.name}] New Chat requested. Clicking New Chat button.`);
-            const newChatButton = document.querySelector(this.newChatSelector);
-            if (newChatButton) {
-                const rect = newChatButton.getBoundingClientRect();
-                const clientX = rect.left + rect.width / 2;
-                const clientY = rect.top + rect.height / 2;
-                
-                newChatButton.dispatchEvent(new PointerEvent('pointerdown', { bubbles: true, pointerType: 'mouse', clientX, clientY }));
-                newChatButton.dispatchEvent(new MouseEvent('mousedown', { bubbles: true, clientX, clientY }));
-                newChatButton.click();
-                newChatButton.dispatchEvent(new PointerEvent('pointerup', { bubbles: true, pointerType: 'mouse', clientX, clientY }));
-                newChatButton.dispatchEvent(new MouseEvent('mouseup', { bubbles: true, clientX, clientY }));
-                
-                // Wait for navigation and reset
-                await new Promise(resolve => setTimeout(resolve, 3000));
-            } else {
-                console.warn(`[${this.name}] New Chat button not found, continuing with current chat.`);
-            }
+          console.log(`[${this.name}] New Chat requested. Current path: ${window.location.pathname}`);
+
+          // Even if we are on / or /chat, we might want to click New Chat to ensure a fresh session
+          const newChatButton = document.querySelector(this.newChatSelector);
+          if (newChatButton) {
+              console.log(`[${this.name}] Found New Chat button, clicking...`);
+              const rect = newChatButton.getBoundingClientRect();
+              const clientX = rect.left + rect.width / 2;
+              const clientY = rect.top + rect.height / 2;
+
+              newChatButton.dispatchEvent(new PointerEvent('pointerdown', { bubbles: true, pointerType: 'mouse', clientX, clientY }));
+              newChatButton.dispatchEvent(new MouseEvent('mousedown', { bubbles: true, clientX, clientY }));
+              newChatButton.focus();
+              newChatButton.dispatchEvent(new PointerEvent('pointerup', { bubbles: true, pointerType: 'mouse', clientX, clientY }));
+              newChatButton.dispatchEvent(new MouseEvent('mouseup', { bubbles: true, clientX, clientY }));
+              newChatButton.click();
+
+              await new Promise(resolve => setTimeout(resolve, 2500));
+          } else {
+              console.warn(`[${this.name}] New Chat button not found via primary selector. Searching by text...`);
+              const allElements = document.querySelectorAll('button, a, div[role="button"], span');
+              let foundElement = null;
+              for (const el of allElements) {
+                  const text = el.textContent.toLowerCase().trim();
+                  const aria = (el.getAttribute('aria-label') || "").toLowerCase();
+                  if (text === 'new chat' || text === 'chatgpt' || aria.includes('new chat')) {
+                      console.log(`[${this.name}] Found potential New Chat element by text/aria:`, el.tagName, text, aria);
+                      foundElement = el;
+                      break;
+                  }
+              }
+
+              if (foundElement) {
+                  const rect = foundElement.getBoundingClientRect();
+                  const clientX = rect.left + rect.width / 2;
+                  const clientY = rect.top + rect.height / 2;
+
+                  foundElement.dispatchEvent(new PointerEvent('pointerdown', { bubbles: true, pointerType: 'mouse', clientX, clientY }));
+                  foundElement.dispatchEvent(new MouseEvent('mousedown', { bubbles: true, clientX, clientY }));
+                  foundElement.focus();
+                  foundElement.dispatchEvent(new PointerEvent('pointerup', { bubbles: true, pointerType: 'mouse', clientX, clientY }));
+                  foundElement.dispatchEvent(new MouseEvent('mouseup', { bubbles: true, clientX, clientY }));
+                  foundElement.click();
+
+                  await new Promise(resolve => setTimeout(resolve, 2500));
+              } else if (window.location.pathname !== "/" && window.location.pathname !== "/chat") {
+                  console.log(`[${this.name}] No button found, but not on homepage. Navigating to /...`);
+                  window.location.href = "/";
+                  await new Promise(resolve => setTimeout(resolve, 4000));
+              }
           }
       }
 

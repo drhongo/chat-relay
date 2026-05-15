@@ -829,8 +829,11 @@ function setupMessageListeners() { // Renamed from setupAutomaticMessageSending
 // The provider calls this when it has determined the final response or a chunk of it.
 function handleProviderResponse(requestId, responseText, isFinal) {
   console.log(CS_LOG_PREFIX, `handleProviderResponse called for requestId: ${requestId}. Data length: ${responseText ? String(responseText).length : 'null'}. isFinal: ${isFinal}. Data (first 100 chars): '${(responseText || "").substring(0,100)}', Type: ${typeof responseText}`);
-  
-  // The requestId parameter here is the one that the provider determined this response is for.
+
+  // Log to relay server for debugging
+  if (isFinal || (responseText && responseText.length % 100 === 0)) {
+      logRemote('info', `Content script sending response for req ${requestId} (final: ${isFinal}, len: ${responseText ? responseText.length : 0})`, requestId);
+  }
   // This should be the definitive requestId for this piece of data.
   // We log if content.js's currentRequestId is different, but proceed with the passed 'requestId'.
   if (currentRequestId !== requestId && currentRequestId !== null) { // also check currentRequestId is not null to avoid warning on initial load or after reset
