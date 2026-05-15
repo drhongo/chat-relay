@@ -142,7 +142,13 @@ async function forwardCommandToContentScript(command) {
       try {
         await new Promise((resolve, reject) => {
             chrome.tabs.sendMessage(activeTabId, { type: "PING_TAB" }, response => {
-                if (chrome.runtime.lastError || !response || !response.success) {
+                if (chrome.runtime.lastError) {
+                    // console.warn("[BG RELAY] PING_TAB failed (tab likely closed):", chrome.runtime.lastError.message);
+                    activeTabId = null;
+                    reject(new Error("Ping failed"));
+                    return;
+                }
+                if (!response || !response.success) {
                     activeTabId = null;
                     reject(new Error("Ping failed"));
                 } else {
@@ -185,7 +191,14 @@ async function forwardCommandToContentScript(command) {
           chrome.tabs.sendMessage(targetTabIdForCommand, command, async (response) => {
             if (chrome.runtime.lastError) {
               const lastErr = chrome.runtime.lastError.message;
-              if (lastErr.includes("Receiving end does not exist") || lastErr.includes("context invalidated")) {
+              console.warn(`[BG RELAY] Error sending to tab ${targetTabIdForCommand}: ${lastErr}`);
+              if (lastErr.includes("Receiving end does not exist") || lastErr.includes("context invalidated") || lastErr.includes("No tab with given id")) {
+                if (lastErr.includes("No tab with given id")) {
+                  console.log(`[BG RELAY] Tab ${targetTabIdForCommand} is gone. Stopping retries.`);
+                  processingRequest = false;
+                  processNextRequest();
+                  return;
+                }
                 console.warn(`[BG RELAY] Context invalidated for tab ${targetTabIdForCommand}. Attempting re-injection...`);
                 try {
                   const tab = await chrome.tabs.get(targetTabIdForCommand);
@@ -201,10 +214,14 @@ async function forwardCommandToContentScript(command) {
                     setTimeout(sendMessageWithRetry, 1000);
                     return;
                   }
-                } catch (e) {}
+                } catch (e) {
+                   console.error(`[BG RELAY] Re-injection failed for tab ${targetTabIdForCommand}:`, e.message);
+                }
               }
               setTimeout(sendMessageWithRetry, SEND_RETRY_DELAY);
+              return;
             }
+            // If we got a response, it was successful (even if response.success is false, the communication worked)
           });
         };
         sendMessageWithRetry();
@@ -404,7 +421,14 @@ async function attachDebuggerAndEnableFetch(tabId, providerName, patterns) {
                         return reject(chrome.runtime.lastError);
                     }
                     console.log(`[BG DEBUGGER] Successfully attached to tab ${tabId}.`);
-                    debuggerAttachedTabs.set(tabId, { providerName, patterns, isFetchEnabled: false, isAttached: true, lastKnownRequestId: null });
+                    debuggerAttachedTabs.set(tabId, {
+                        providerName,
+                        patterns,
+                        isFetchEnabled: false,
+                        isAttached: true,
+                        lastKnownRequestId: null,
+                        matchedNetworkRequestIds: new Set()
+                    });
                     resolve();
                 });
             });
@@ -442,12 +466,20 @@ async function detachDebugger(tabId) {
     const attachmentDetails = debuggerAttachedTabs.get(tabId);
     if (attachmentDetails && attachmentDetails.isAttached) {
         chrome.debugger.detach({ tabId }, () => {
+            if (chrome.runtime.lastError) {
+                // Ignore errors like "No tab with given id" as it means it's already detached/gone
+                // console.warn(`[BG DEBUGGER] Detach failed for tab ${tabId}:`, chrome.runtime.lastError.message);
+            }
             debuggerAttachedTabs.delete(tabId);
         });
     }
 }
 
-chrome.tabs.onRemoved.addListener(detachDebugger);
+chrome.tabs.onRemoved.addListener((tabId) => {
+    console.log(`[BG RELAY] Tab ${tabId} removed.`);
+    if (activeTabId === tabId) activeTabId = null;
+    detachDebugger(tabId);
+});
 chrome.runtime.onSuspend.addListener(() => {
     for (const tabId of debuggerAttachedTabs.keys()) detachDebugger(tabId);
 });
@@ -465,6 +497,60 @@ chrome.debugger.onEvent.addListener((debuggeeId, message, params) => {
     const currentOperationRequestId = (tabInfo && tabInfo.lastKnownRequestId !== null)
         ? tabInfo.lastKnownRequestId
         : lastRequestId;
+
+    if (message === "Network.requestWillBeSent") {
+        const url = params.request.url;
+        const method = params.request.method;
+        if (tabInfo && tabInfo.patterns && tabInfo.matchedNetworkRequestIds) {
+            const matchesPattern = tabInfo.patterns.some(p => {
+                // Better glob to regex: escape special chars, then replace * with .*
+                const regexStr = String(p.urlPattern)
+                    .replace(/[.+^${}()|[\]\\]/g, '\\$&') // Escape regex chars (except *)
+                    .replace(/\*/g, '.*');               // Convert * to .*
+                const patternRegex = new RegExp('^' + regexStr + '$', 'i');
+                // Also check if the URL just contains the pattern if it's a simple string like "*conversation*"
+                if (p.urlPattern.includes('conversation') && url.toLowerCase().includes('conversation')) return true;
+                return patternRegex.test(url);
+            });
+
+            if (matchesPattern) {
+                tabInfo.matchedNetworkRequestIds.add(params.requestId);
+                console.log(`[BG DEBUGGER] Network.requestWillBeSent: matched URL ${url}, added requestId ${params.requestId} to matched set for tab ${tabId}.`);
+            } else {
+                // Fallback: If it's a POST request to the same domain as the provider, and we haven't matched anything yet,
+                // or if it's a known chat domain, consider matching it if it looks like an API call.
+                const isPost = method === 'POST';
+                const lowerUrl = url.toLowerCase();
+                const isChatDomain = lowerUrl.includes('chatgpt.com') || lowerUrl.includes('openai.com');
+
+                if (isPost && isChatDomain && !lowerUrl.includes('.js') && !lowerUrl.includes('.css') && !lowerUrl.includes('.png')) {
+                    tabInfo.matchedNetworkRequestIds.add(params.requestId);
+                    console.log(`[BG DEBUGGER] Network.requestWillBeSent (FALLBACK MATCH): matched POST to ${url}, added requestId ${params.requestId} to matched set for tab ${tabId}.`);
+                } else if (isChatDomain && !lowerUrl.includes('.js') && !lowerUrl.includes('.css') && !lowerUrl.includes('.png') && !lowerUrl.includes('.woff')) {
+                     // Log other potentially interesting URLs that were missed
+                     console.log(`[BG DEBUGGER] NOT matched (but chat domain): ${method} ${url}`);
+                }
+            }
+        }
+    }
+
+    if (message === "Network.responseReceived") {
+        const url = params.response.url;
+        if (tabInfo && tabInfo.patterns && tabInfo.matchedNetworkRequestIds) {
+            const matchesPattern = tabInfo.patterns.some(p => {
+                const regexStr = String(p.urlPattern)
+                    .replace(/[.+^${}()|[\]\\]/g, '\\$&')
+                    .replace(/\*/g, '.*');
+                const patternRegex = new RegExp('^' + regexStr + '$', 'i');
+                if (p.urlPattern.includes('conversation') && url.toLowerCase().includes('conversation')) return true;
+                return patternRegex.test(url);
+            });
+            if (matchesPattern && !tabInfo.matchedNetworkRequestIds.has(params.requestId)) {
+                tabInfo.matchedNetworkRequestIds.add(params.requestId);
+                console.log(`[BG DEBUGGER] Network.responseReceived: matched URL ${url}, added requestId ${params.requestId} to matched set for tab ${tabId}.`);
+            }
+        }
+    }
 
     if (message === "Fetch.requestPaused") {
         const url = params.request.url;
@@ -487,16 +573,29 @@ chrome.debugger.onEvent.addListener((debuggeeId, message, params) => {
 
         sendRemoteLog('info', `Debugger matched request for ${tabInfo.providerName}: ${url.substring(0, 100)}...`, currentOperationRequestId);
         console.log(`[BG DEBUGGER] Matching request found: ${url}. Continuing immediately to avoid blocking stream.`);
+
+        // Track this networkId so we only process Network events for this specific request
+        if (params.networkId && tabInfo.matchedNetworkRequestIds) {
+            tabInfo.matchedNetworkRequestIds.add(params.networkId);
+            console.log(`[BG DEBUGGER] Added networkId ${params.networkId} to matched set for tab ${tabId}.`);
+        }
+
         // Continue immediately so the UI remains responsive and streaming works
         chrome.debugger.sendCommand(debuggeeId, "Fetch.continueRequest", { requestId: params.requestId });
     }
 
     if (message === "Network.eventSourceMessageReceived") {
+        if (!tabInfo || !tabInfo.matchedNetworkRequestIds || !tabInfo.matchedNetworkRequestIds.has(params.requestId)) {
+            // Not a request we are tracking
+            // console.log(`[BG DEBUGGER] Filtering out Network.eventSourceMessageReceived for untracked requestId ${params.requestId} in tab ${tabId}.`);
+            return;
+        }
+
         console.log(`[BG DEBUGGER] SSE Message in tab ${tabId} for request ${params.requestId}`);
         // This gives us real-time chunks for SSE!
         chrome.tabs.get(tabId, (tab) => {
             if (chrome.runtime.lastError || !tab) {
-                console.warn(`[BG DEBUGGER] Cannot send SSE message, tab ${tabId} no longer exists.`);
+                // console.warn(`[BG DEBUGGER] Cannot send SSE message, tab ${tabId} no longer exists.`);
                 return;
             }
             chrome.tabs.sendMessage(tabId, {
@@ -518,9 +617,22 @@ chrome.debugger.onEvent.addListener((debuggeeId, message, params) => {
     if (message === "Network.loadingFinished") {
         if (!tabInfo || currentOperationRequestId === null) return;
 
+        if (!tabInfo.matchedNetworkRequestIds || !tabInfo.matchedNetworkRequestIds.has(params.requestId)) {
+            // Not a request we are tracking
+            return;
+        }
+
         // When the request finishes, we can get the clean, full body as a final check
         chrome.debugger.sendCommand(debuggeeId, "Network.getResponseBody", { requestId: params.requestId }, (response) => {
-            if (chrome.runtime.lastError) return;
+            // Clean up the tracking ID after processing the final body
+            if (tabInfo.matchedNetworkRequestIds) {
+                tabInfo.matchedNetworkRequestIds.delete(params.requestId);
+            }
+
+            if (chrome.runtime.lastError) {
+                // console.warn(`[BG DEBUGGER] Network.getResponseBody failed:`, chrome.runtime.lastError.message);
+                return;
+            }
 
             let processedData = null;
             if (response && response.body) {

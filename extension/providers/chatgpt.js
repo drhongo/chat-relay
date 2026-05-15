@@ -687,8 +687,19 @@ class ChatGptProvider {
                 continue;
             }
         } catch (e) {
+            // Check if it's likely JavaScript or other non-SSE content
+            const trimmedLine = line.trim();
+            if (trimmedLine.startsWith('import ') ||
+                trimmedLine.startsWith('export ') ||
+                trimmedLine.startsWith('function(') ||
+                trimmedLine.includes('react.memo_cache_sentinel') ||
+                trimmedLine.length > 500) { // Likely minified JS or large binary chunk
+                // Silently skip likely non-SSE content
+                continue;
+            }
+
             // Not JSON either, so warn
-            console.warn(`[${this.name}] parseDebuggerResponse - Unexpected non-data SSE line: ${line}`);
+            console.warn(`[${this.name}] parseDebuggerResponse - Unexpected non-data SSE line: ${line.substring(0, 100)}${line.length > 100 ? '...' : ''}`);
         }
       }
     }
@@ -843,7 +854,8 @@ class ChatGptProvider {
       return [
         { urlPattern: "*://chatgpt.com/backend-api/conversation*", requestStage: "Response" },
         { urlPattern: "*://chatgpt.com/backend-api/f/conversation*", requestStage: "Response" },
-        { urlPattern: "*://chat.openai.com/backend-api/conversation*", requestStage: "Response" }
+        { urlPattern: "*://chat.openai.com/backend-api/conversation*", requestStage: "Response" },
+        { urlPattern: "*conversation*", requestStage: "Response" }
       ];
     }
     // For websocket method, we don't need to return any patterns as we are not using the debugger.
