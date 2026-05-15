@@ -80,11 +80,15 @@ class ClaudeProvider {
     // Robust check for New Chat request
     if (typeof messageOrId === 'object' && messageOrId.settings && messageOrId.settings.new_chat) {
         const currentPath = window.location.pathname;
-        // Already on a fresh chat page — no need to navigate
-        if (currentPath === '/new' || currentPath === '/') {
-            console.log(`[${this.name}] New Chat requested but already on fresh page: ${currentPath}. Skipping.`);
+        const isOnFreshPage = currentPath === '/new' || currentPath === '/' || currentPath === '';
+        const hasNoMessages = document.querySelectorAll('[data-testid="user-message"]').length === 0;
+
+        if (isOnFreshPage && hasNoMessages) {
+            // Already on a fresh chat with no messages — skip navigation
+            console.log(`[${this.name}] New Chat requested but already on fresh empty page. Skipping.`);
         } else {
-            console.log(`[${this.name}] New Chat requested. Clicking New Chat button.`);
+            // On an existing conversation or fresh page that already has messages — start a new chat
+            console.log(`[${this.name}] New Chat requested. Current path: ${currentPath}. Attempting to navigate.`);
             const newChatButtons = this._findDeep(document, this.newChatSelector);
             if (newChatButtons.length > 0) {
                 const newChatButton = newChatButtons[0];
@@ -102,7 +106,7 @@ class ClaudeProvider {
 
                 await new Promise(resolve => setTimeout(resolve, 3000));
             } else {
-                // Fallback: navigate to /new
+                // Fallback: navigate directly to /new
                 console.log(`[${this.name}] New Chat button not found, navigating to /new...`);
                 window.location.href = "https://claude.ai/new";
                 await new Promise(resolve => setTimeout(resolve, 5000));
