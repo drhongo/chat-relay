@@ -79,46 +79,33 @@ class ClaudeProvider {
 
     // Robust check for New Chat request
     if (typeof messageOrId === 'object' && messageOrId.settings && messageOrId.settings.new_chat) {
-        console.log(`[${this.name}] New Chat requested. Clicking New Chat button.`);
-        const newChatButtons = this._findDeep(document, this.newChatSelector);
-        if (newChatButtons.length > 0) {
-            const newChatButton = newChatButtons[0];
-            console.log(`[${this.name}] Found New Chat button, clicking...`);
-            const rect = newChatButton.getBoundingClientRect();
-            const clientX = rect.left + rect.width / 2;
-            const clientY = rect.top + rect.height / 2;
-
-            newChatButton.dispatchEvent(new PointerEvent('pointerdown', { bubbles: true, pointerType: 'mouse', clientX, clientY }));
-            newChatButton.dispatchEvent(new MouseEvent('mousedown', { bubbles: true, clientX, clientY }));
-            newChatButton.focus();
-            newChatButton.dispatchEvent(new PointerEvent('pointerup', { bubbles: true, pointerType: 'mouse', clientX, clientY }));
-            newChatButton.dispatchEvent(new MouseEvent('mouseup', { bubbles: true, clientX, clientY }));
-            newChatButton.click();
-
-            await new Promise(resolve => setTimeout(resolve, 3000));
+        const currentPath = window.location.pathname;
+        // Already on a fresh chat page — no need to navigate
+        if (currentPath === '/new' || currentPath === '/') {
+            console.log(`[${this.name}] New Chat requested but already on fresh page: ${currentPath}. Skipping.`);
         } else {
-            console.warn(`[${this.name}] New Chat button not found via selectors. Searching by text...`);
-            const allButtons = this._findDeep(document, 'button, a, div[role="button"]');
-            let foundByText = null;
-            for (const btn of allButtons) {
-                const text = (btn.textContent || "").trim().toLowerCase();
-                if (text === "new chat" || text === "start a new chat") {
-                    foundByText = btn;
-                    break;
-                }
-            }
+            console.log(`[${this.name}] New Chat requested. Clicking New Chat button.`);
+            const newChatButtons = this._findDeep(document, this.newChatSelector);
+            if (newChatButtons.length > 0) {
+                const newChatButton = newChatButtons[0];
+                console.log(`[${this.name}] Found New Chat button, clicking...`);
+                const rect = newChatButton.getBoundingClientRect();
+                const clientX = rect.left + rect.width / 2;
+                const clientY = rect.top + rect.height / 2;
 
-            if (foundByText) {
-                console.log(`[${this.name}] Found New Chat element by text content.`);
-                foundByText.click();
+                newChatButton.dispatchEvent(new PointerEvent('pointerdown', { bubbles: true, pointerType: 'mouse', clientX, clientY }));
+                newChatButton.dispatchEvent(new MouseEvent('mousedown', { bubbles: true, clientX, clientY }));
+                newChatButton.focus();
+                newChatButton.dispatchEvent(new PointerEvent('pointerup', { bubbles: true, pointerType: 'mouse', clientX, clientY }));
+                newChatButton.dispatchEvent(new MouseEvent('mouseup', { bubbles: true, clientX, clientY }));
+                newChatButton.click();
+
                 await new Promise(resolve => setTimeout(resolve, 3000));
             } else {
-                console.warn(`[${this.name}] No button found, but if we are on /new, maybe it's fine. Current path: ${window.location.pathname}`);
-                if (window.location.pathname !== "/new" && window.location.pathname !== "/") {
-                   console.log(`[${this.name}] Not on homepage, navigating...`);
-                   window.location.href = "https://claude.ai/";
-                   await new Promise(resolve => setTimeout(resolve, 5000));
-                }
+                // Fallback: navigate to /new
+                console.log(`[${this.name}] New Chat button not found, navigating to /new...`);
+                window.location.href = "https://claude.ai/new";
+                await new Promise(resolve => setTimeout(resolve, 5000));
             }
         }
     }
@@ -404,10 +391,10 @@ class ClaudeProvider {
         }
       }, 3000); // 3s delay gives time for message send + UI response to start
     } else {
-      // DOM-only mode: also wait 3s for the send to complete before monitoring
+      // DOM-only mode: wait 2s for send to complete and Claude to start responding
       this.domFallbackTimer = setTimeout(() => {
         this._startDOMMonitoring(requestId);
-      }, 3000);
+      }, 2000);
     }
   }
 
@@ -580,16 +567,25 @@ class ClaudeProvider {
         }
     }
 
-    // Strip user message echo if it appears at the start
+    // Clean up the captured text
     const sentTrimmed = this.lastSentMessage.trim();
     let text = (element.innerText || element.textContent || "").trim();
 
+    // Strip user message echo if it appears at the start
     if (sentTrimmed && text.startsWith(sentTrimmed)) {
         text = text.slice(sentTrimmed.length).trim();
     }
 
-    // Also strip model name lines like "Haiku 4.5" that appear after the user message
-    text = text.replace(/^(Claude|Haiku|Sonnet|Opus)\s[\d.]+\s*\n?/i, '').trim();
+    // Strip known Claude UI prefix labels
+    text = text.replace(/^Claude responded:\s*/i, '').trim();
+    text = text.replace(/^Claude\s*\n/i, '').trim();
+    text = text.replace(/^(Haiku|Sonnet|Opus|Claude)\s[\d.]+\s*\n/i, '').trim();
+
+    // Deduplicate repeated paragraphs (artifact of capturing a wider container):
+    // Split on double newlines and remove any paragraph that is identical to the next one
+    const paras = text.split('\n\n');
+    const deduped = paras.filter((para, i) => i === 0 || para.trim() !== paras[i - 1].trim());
+    text = deduped.join('\n\n').trim();
 
     const isStillGenerating = this._isGenerating();
     if (text.length > 0) {
@@ -600,9 +596,17 @@ class ClaudeProvider {
   }
 
   _isGenerating() {
-    // Claude shows a "Stop response" button only while streaming
+    // Claude shows a "Stop response" button only while streaming.
+    // Also check for streaming cursor/animation elements.
     const stopButtons = Array.from(document.querySelectorAll('button[aria-label*="Stop" i]'));
-    return stopButtons.some(btn => btn.offsetParent !== null && btn.offsetWidth > 0);
+    const stopVisible = stopButtons.some(btn => btn.offsetParent !== null && btn.offsetWidth > 0);
+    if (stopVisible) return true;
+
+    // Secondary check: look for streaming cursor or animation
+    const streamingIndicators = document.querySelectorAll(
+        '.streaming-cursor, [class*="cursor-blink"], [class*="streaming"], .loading-dots'
+    );
+    return streamingIndicators.length > 0;
   }
 
   getStreamingApiPatterns() {
@@ -638,7 +642,8 @@ class ClaudeProvider {
     let lastCapturedText = "";
     let noChangeCount = 0;
     let totalChecks = 0;
-    const maxNoChange = 6;  // Finalize after 6s of no change
+    let generationStarted = false; // Track whether we've seen the Stop button appear
+    const maxNoChange = 6;   // Finalize after 6s of stable text once generation stopped
     const maxTotalChecks = 90; // Hard cap: 90 seconds total
 
     const monitor = () => {
@@ -649,6 +654,9 @@ class ClaudeProvider {
         }
 
         totalChecks++;
+
+        const isGenerating = this._isGenerating();
+        if (isGenerating) generationStarted = true;
 
         const result = this._captureResponseDOM();
         if (result.found) {
@@ -662,16 +670,18 @@ class ClaudeProvider {
         }
 
         // Finish conditions:
-        // 1. Found text + generation stopped
-        // 2. Text hasn't changed for maxNoChange seconds
-        // 3. Hard timeout
-        const stoppedGenerating = result.found && !result.isStillGenerating && lastCapturedText.length > 0;
-        const noChangeTimeout = result.found && noChangeCount >= maxNoChange;
+        // 1. Generation was seen to start AND stopped, text stable for 2s
+        // 2. Generation never seen (very fast response) — text stable for 3s after monitor start
+        // 3. Text hasn't changed for maxNoChange seconds regardless
+        // 4. Hard timeout
+        const stoppedGenerating = generationStarted && !isGenerating && lastCapturedText.length > 0 && noChangeCount >= 2;
+        const fastResponse = !generationStarted && lastCapturedText.length > 0 && noChangeCount >= 3 && totalChecks >= 5;
+        const noChangeTimeout = lastCapturedText.length > 0 && noChangeCount >= maxNoChange;
         const hardTimeout = totalChecks >= maxTotalChecks;
-        const shouldFinalize = stoppedGenerating || noChangeTimeout || hardTimeout;
+        const shouldFinalize = stoppedGenerating || fastResponse || noChangeTimeout || hardTimeout;
 
         if (shouldFinalize) {
-            const reason = stoppedGenerating ? 'generating_stopped' : noChangeTimeout ? 'no_change_timeout' : 'hard_timeout';
+            const reason = stoppedGenerating ? 'generating_stopped' : fastResponse ? 'fast_response' : noChangeTimeout ? 'no_change_timeout' : 'hard_timeout';
             console.log(`[${this.name}] DOM monitoring finishing for ${requestId}. Reason: ${reason}. Text len: ${lastCapturedText.length}`);
             if (lastCapturedText.length > 0) {
                 callback(requestId, lastCapturedText, true);
@@ -684,7 +694,7 @@ class ClaudeProvider {
             this.domMonitorTimer = setTimeout(monitor, 1000);
         }
     };
-    this.domMonitorTimer = setTimeout(monitor, 500);
+    this.domMonitorTimer = setTimeout(monitor, 1000); // Start 1s after monitoring begins
   }
 
   _stopDOMMonitoring() {
