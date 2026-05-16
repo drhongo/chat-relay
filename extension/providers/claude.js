@@ -21,564 +21,706 @@ class ClaudeProvider {
   constructor() {
     // --- START OF CONFIGURABLE PROPERTIES ---
     // Method for response capture: "debugger" or "dom"
-    this.captureMethod = "debugger";
+    this.captureMethod = "dom"; // DOM is more reliable for Claude.ai
     // URL pattern for debugger to intercept if captureMethod is "debugger". Ensure this is specific.
-    this.debuggerUrlPattern = "*/completion*"; // VERIFY THIS PATTERN
+    this.debuggerUrlPattern = "*://claude.ai/api/organizations/*/conversations/*/completion*";
     // Whether to include "thinking" process in the message or just the final answer.
     // If true, parseDebuggerResponse returns a JSON string: { "thinking": "...", "answer": "..." }
     // If false, parseDebuggerResponse returns a string: "answer"
     this.includeThinkingInMessage = false;
-
-    // Option to enable AI Studio function calling on load
-    // ENABLE_CLAUDE_FUNCTION_CALLING: true or false
-    this.ENABLE_CLAUDE_FUNCTION_CALLING = true;
     // --- END OF CONFIGURABLE PROPERTIES ---
 
-    this.name = "ClaudeProvider"; // Updated name
+    this.name = "ClaudeProvider";
     this.supportedDomains = ["claude.ai"];
-    
-    // Selectors for the AI Studio interface
-    this.inputSelector = 'div.ProseMirror[contenteditable="true"]';
-    
-    // The send button selector
-    this.sendButtonSelector = 'button[aria-label="Send message"]';
-    
+
+    // Selectors for the Claude interface
+    // Input: data-testid="chat-input" is the Tiptap editor Claude actually uses
+    this.inputSelector = '[data-testid="chat-input"], div.ProseMirror[contenteditable="true"], .tiptap.ProseMirror, .ProseMirror';
+    // Send button: appears after typing; Claude uses aria-label="Send message" on the submit button
+    // Also try by position — the last button inside the input container
+    this.sendButtonSelector = 'button[aria-label*="Send message" i], button[aria-label*="send message" i], button[aria-label="Send Message"], [data-testid="send-button"]';
+    this.newChatSelector = '[data-testid*="new-chat"], a[href="/new"], [aria-label*="New chat" i], [aria-label*="Start a new chat" i]';
+
     // Updated response selectors based on the actual elements
-    this.responseSelector = '.response-container, .response-text, .model-response, .model-response-container, ms-chat-turn, ms-prompt-chunk, ms-text-chunk, .very-large-text-container, .cmark-node';
-    
+    this.responseSelector = '.font-claude-message, [data-testid="message-container"], .model-response, .model-response-container, ms-chat-turn, .very-large-text-container, .cmark-node, .claude-message';
+
     // Thinking indicator selector
-    this.thinkingIndicatorSelector = '.thinking-indicator, .loading-indicator, .typing-indicator, .response-loading, loading-indicator';
+    this.thinkingIndicatorSelector = '.thinking-indicator, .loading-indicator, .typing-indicator, .response-loading, .loading, [aria-label*="Stop" i]';
 
     // Fallback selectors
-    this.responseSelectorForDOMFallback = '.response-container, .model-response-text'; // Placeholder, adjust as needed
-    this.thinkingIndicatorSelectorForDOM = '.thinking-indicator, .spinner'; // Placeholder, adjust as needed
-    
+    this.responseSelectorForDOMFallback = '.font-claude-message, [data-testid="message-container"], .claude-message';
+    this.thinkingIndicatorSelectorForDOM = '.thinking-indicator, .loading, .spinner, .loading-indicator';
+
     // Last sent message to avoid capturing it as a response
     this.lastSentMessage = '';
 
     // Initialize pendingResponseCallbacks
     this.pendingResponseCallbacks = new Map();
-    this.requestBuffers = new Map(); // To accumulate text for each request
+    this.requestAccumulators = new Map(); // To accumulate text for each request
+    this.domFallbackTimeout = 15000;
+    this.domFallbackTimer = null;
+    this.domMonitorTimer = null;
 
-    // Call the method to ensure function calling is enabled on initial load
-    // this.ensureFunctionCallingEnabled(); // Commented out as per user request
-
-    // Listen for SPA navigation events to re-trigger the check
-    // if (window.navigation) {
-    //   window.navigation.addEventListener('navigate', (event) => {
-    //     // We are interested in same-document navigations, common in SPAs
-    //     if (!event.canIntercept || event.hashChange || event.downloadRequest !== null) {
-    //       return;
-    //     }
-    //     // Check if the navigation is within the same origin and path structure of AI Studio
-    //     const currentUrl = new URL(window.location.href);
-    //     const destinationUrl = new URL(event.destination.url);
-
-    //     if (currentUrl.origin === destinationUrl.origin && destinationUrl.pathname.startsWith("/prompts/")) {
-    //       console.log(`[${this.name}] Detected SPA navigation to: ${event.destination.url}. Re-checking function calling toggle.`);
-    //       // Use a timeout to allow the new view's DOM to settle
-    //       setTimeout(() => {
-    //         // this.ensureFunctionCallingEnabled(); // Commented out
-    //       }, 1000); // Delay to allow DOM update
-    //     }
-    //   });
-    // } else {
-    //   console.warn(`[${this.name}] window.navigation API not available. Function calling toggle may not re-enable on SPA navigations.`);
-    // }
-  } // This curly brace correctly closes the constructor.
-
-  /* // Commenting out the entire method as per user request
-  ensureFunctionCallingEnabled() {
-    if (!this.ENABLE_CLAUDE_FUNCTION_CALLING) {
-      console.log(`[${this.name}] Function calling is disabled by configuration. Skipping.`);
-      return;
-    }
-
-    const checkInterval = 500; // ms
-    const maxDuration = 7000; // ms
-    let elapsedTime = 0;
-    const providerName = this.name;
-
-    // Clear any existing timer for this specific functionality to avoid multiple polling loops
-    if (this.functionCallingPollTimer) {
-        clearTimeout(this.functionCallingPollTimer);
-        this.functionCallingPollTimer = null;
-        console.log(`[${providerName}] Cleared previous function calling poll timer.`);
-    }
-    
-    console.log(`[${providerName}] Ensuring function calling is enabled (polling up to ${maxDuration / 1000}s).`);
-
-    const tryEnableFunctionCalling = () => {
-      console.log(`[${providerName}] Polling for function calling toggle. Elapsed: ${elapsedTime}ms`);
-      const functionCallingToggle = document.querySelector('button[aria-label="Function calling"]');
-
-      if (functionCallingToggle) {
-        const isChecked = functionCallingToggle.getAttribute('aria-checked') === 'true';
-        if (!isChecked) {
-          console.log(`[${providerName}] Function calling toggle found and is NOT checked. Attempting to enable...`);
-          functionCallingToggle.click();
-          // Verify after a short delay if the click was successful
-          setTimeout(() => {
-            const stillChecked = functionCallingToggle.getAttribute('aria-checked') === 'true';
-            if (stillChecked) {
-              console.log(`[${providerName}] Function calling successfully enabled after click.`);
-            } else {
-              console.warn(`[${providerName}] Clicked function calling toggle, but it did NOT become checked. It might be disabled or unresponsive.`);
-            }
-          }, 200);
-        } else {
-          console.log(`[${providerName}] Function calling toggle found and is already enabled.`);
-        }
-        this.functionCallingPollTimer = null; // Clear timer once action is taken or element found
-      } else {
-        elapsedTime += checkInterval;
-        if (elapsedTime < maxDuration) {
-          console.log(`[${providerName}] Function calling toggle not found, will retry in ${checkInterval}ms.`);
-          this.functionCallingPollTimer = setTimeout(tryEnableFunctionCalling, checkInterval);
-        } else {
-          console.warn(`[${providerName}] Function calling toggle button (selector: 'button[aria-label="Function calling"]') not found after ${maxDuration}ms. It might not be available on this page/view or selector is incorrect.`);
-          this.functionCallingPollTimer = null; // Clear timer
-        }
-      }
-    };
-
-    // Start the first attempt after a brief initial delay
-    this.functionCallingPollTimer = setTimeout(tryEnableFunctionCalling, 500);
+    this._loadSettings();
+    console.log(`[${this.name}] Provider initialized.`);
   }
-  */
+
+  _loadSettings() {
+    chrome.storage.sync.get({ claudeCaptureMethod: 'dom' }, (items) => {
+      this.captureMethod = items.claudeCaptureMethod;
+      console.log(`[${this.name}] Capture method updated to: ${this.captureMethod}`);
+    });
+  }
 
   // Send a message to the chat interface
-  async sendChatMessage(messageContent) {
-    console.log(`[${this.name}] sendChatMessage called with content type:`, typeof messageContent, Array.isArray(messageContent) ? `Array length: ${messageContent.length}` : '');
-    const inputField = document.querySelector(this.inputSelector);
-    const sendButton = document.querySelector(this.sendButtonSelector);
+  async sendChatMessage(messageContent, messageOrId) {
+    const requestId = typeof messageOrId === 'object' ? messageOrId.requestId : messageOrId;
+    console.log(`[${this.name}] sendChatMessage called for requestId ${requestId}`);
 
-    if (!inputField || !sendButton) {
-      console.error(`[${this.name}] Missing input field or send button. Input: ${this.inputSelector}, Button: ${this.sendButtonSelector}`);
+    // Robust check for New Chat request
+    if (typeof messageOrId === 'object' && messageOrId.settings && messageOrId.settings.new_chat) {
+        const currentPath = window.location.pathname;
+        const isOnFreshPage = currentPath === '/new' || currentPath === '/' || currentPath === '';
+        const hasNoMessages = document.querySelectorAll('[data-testid="user-message"]').length === 0;
+
+        if (isOnFreshPage && hasNoMessages) {
+            // Already on a fresh chat with no messages — skip navigation
+            console.log(`[${this.name}] New Chat requested but already on fresh empty page. Skipping.`);
+        } else {
+            // On an existing conversation or fresh page that already has messages — start a new chat
+            console.log(`[${this.name}] New Chat requested. Current path: ${currentPath}. Attempting to navigate.`);
+            const newChatButtons = this._findDeep(document, this.newChatSelector);
+            if (newChatButtons.length > 0) {
+                const newChatButton = newChatButtons[0];
+                console.log(`[${this.name}] Found New Chat button, clicking...`);
+                const rect = newChatButton.getBoundingClientRect();
+                const clientX = rect.left + rect.width / 2;
+                const clientY = rect.top + rect.height / 2;
+
+                newChatButton.dispatchEvent(new PointerEvent('pointerdown', { bubbles: true, pointerType: 'mouse', clientX, clientY }));
+                newChatButton.dispatchEvent(new MouseEvent('mousedown', { bubbles: true, clientX, clientY }));
+                newChatButton.focus();
+                newChatButton.dispatchEvent(new PointerEvent('pointerup', { bubbles: true, pointerType: 'mouse', clientX, clientY }));
+                newChatButton.dispatchEvent(new MouseEvent('mouseup', { bubbles: true, clientX, clientY }));
+                newChatButton.click();
+
+                await new Promise(resolve => setTimeout(resolve, 3000));
+            } else {
+                // Fallback: navigate directly to /new
+                console.log(`[${this.name}] New Chat button not found, navigating to /new...`);
+                window.location.href = "https://claude.ai/new";
+                await new Promise(resolve => setTimeout(resolve, 5000));
+            }
+        }
+    }
+
+    // 1. Polling for Input Field using shadow-piercing search
+    let inputField = null;
+    let pollAttempts = 0;
+    const maxPollAttempts = 15;
+
+    while (pollAttempts < maxPollAttempts) {
+        const inputFields = this._findDeep(document, this.inputSelector);
+        if (inputFields.length > 0) {
+            inputField = inputFields[0];
+            console.log(`[${this.name}] Input field found after ${pollAttempts + 1} attempts.`);
+            break;
+        }
+        await new Promise(resolve => setTimeout(resolve, 1000));
+        pollAttempts++;
+    }
+
+    if (!inputField) {
+      console.error(`[${this.name}] Missing input field. Selector: ${this.inputSelector}`);
+      this._reportSendError(requestId, "Input field not found after polling.");
       return false;
     }
 
-    console.log(`[${this.name}] Attempting to send message to AI Studio with:`, {
-      inputField: inputField.className,
-      sendButton: sendButton.getAttribute('aria-label') || sendButton.className
-    });
-
     try {
+      this.lastSentMessage = ""; // Will be set below
+
       let textToInput = "";
       let blobToPaste = null;
-      let blobMimeType = "image/png"; // Default MIME type
+      let blobMimeType = "image/png";
 
       if (typeof messageContent === 'string') {
         textToInput = messageContent;
         this.lastSentMessage = textToInput;
-        console.log(`[${this.name}] Handling string content:`, textToInput.substring(0, 100) + "...");
       } else if (messageContent instanceof Blob) {
         blobToPaste = messageContent;
         blobMimeType = messageContent.type || blobMimeType;
-        this.lastSentMessage = `Blob data (type: ${blobMimeType}, size: ${blobToPaste.size})`;
-        console.log(`[${this.name}] Handling Blob content. Size: ${blobToPaste.size}, Type: ${blobMimeType}`);
+        this.lastSentMessage = `Blob data (${blobMimeType}, size: ${blobToPaste.size})`;
       } else if (Array.isArray(messageContent)) {
-        console.log(`[${this.name}] Handling array content.`);
         for (const part of messageContent) {
           if (part.type === "text" && typeof part.text === 'string') {
             textToInput += (textToInput ? "\n" : "") + part.text;
-            console.log(`[${this.name}] Added text part:`, part.text.substring(0, 50) + "...");
           } else if (part.type === "image_url" && part.image_url && typeof part.image_url.url === 'string') {
-            if (!blobToPaste) { // Prioritize the first image found
+            if (!blobToPaste) {
               try {
                 const response = await fetch(part.image_url.url);
                 blobToPaste = await response.blob();
                 blobMimeType = blobToPaste.type || blobMimeType;
-                console.log(`[${this.name}] Fetched image_url as Blob. Size: ${blobToPaste.size}, Type: ${blobMimeType}`);
               } catch (e) {
-                console.error(`[${this.name}] Error fetching image_url ${part.image_url.url}:`, e);
+                console.error(`[${this.name}] Error fetching image_url:`, e);
               }
-            } else {
-              console.warn(`[${this.name}] Multiple image_urls found, only the first will be pasted.`);
             }
           }
         }
-        this.lastSentMessage = `Array content (Text: "${textToInput.substring(0,50)}...", Image: ${blobToPaste ? 'Yes' : 'No'})`;
-      } else {
-        console.error(`[${this.name}] Unhandled message content type: ${typeof messageContent}. Cannot send.`);
-        this.lastSentMessage = `Unhandled data type: ${typeof messageContent}`;
-        return false;
+        this.lastSentMessage = textToInput || "Array content with image";
       }
 
-      // Set text input if any
+      // 2. Insert Text into Input Field (Tiptap editor)
       if (textToInput) {
-        inputField.textContent = textToInput; // Use textContent for contenteditable div
-        inputField.dispatchEvent(new Event('input', { bubbles: true }));
-        console.log(`[${this.name}] Set input field textContent with accumulated text.`);
+        inputField.focus();
+        await new Promise(resolve => setTimeout(resolve, 200));
+
+        let insertSucceeded = false;
+
+        // Method 1: Clipboard paste — most reliable for Tiptap
+        try {
+            const dt = new DataTransfer();
+            dt.setData('text/plain', textToInput);
+            inputField.dispatchEvent(new ClipboardEvent('paste', { clipboardData: dt, bubbles: true, cancelable: true }));
+            await new Promise(resolve => setTimeout(resolve, 200));
+            const afterPaste = (inputField.innerText || inputField.textContent || "").trim();
+            if (afterPaste.length > 0) {
+                insertSucceeded = true;
+                console.log(`[${this.name}] Text inserted via paste. Content: "${afterPaste.substring(0, 60)}"`);
+            }
+        } catch (e) {
+            console.warn(`[${this.name}] Paste failed: ${e.message}`);
+        }
+
+        // Method 2: execCommand insertText
+        if (!insertSucceeded) {
+            try {
+                document.execCommand('selectAll', false, null);
+                document.execCommand('delete', false, null);
+                document.execCommand('insertText', false, textToInput);
+                await new Promise(resolve => setTimeout(resolve, 200));
+                if ((inputField.innerText || "").trim().length > 0) {
+                    insertSucceeded = true;
+                    console.log(`[${this.name}] Text inserted via execCommand.`);
+                }
+            } catch (e) {
+                console.warn(`[${this.name}] execCommand failed: ${e.message}`);
+            }
+        }
+
+        // Method 3: Simulate keyboard typing character by character (slow but reliable)
+        if (!insertSucceeded) {
+            console.log(`[${this.name}] Trying keyboard simulation...`);
+            inputField.focus();
+            // Clear first
+            document.execCommand('selectAll', false, null);
+            document.execCommand('delete', false, null);
+            // Type character by character
+            for (const char of textToInput.substring(0, 500)) { // limit to 500 chars for perf
+                document.execCommand('insertText', false, char);
+            }
+            await new Promise(resolve => setTimeout(resolve, 100));
+            if ((inputField.innerText || "").trim().length > 0) {
+                insertSucceeded = true;
+                console.log(`[${this.name}] Text inserted via keyboard simulation.`);
+            }
+        }
+
+        if (!insertSucceeded) {
+            console.error(`[${this.name}] All text insertion methods failed!`);
+        }
+
+        // Trigger input event so Tiptap/React enables the send button
+        inputField.dispatchEvent(new Event('input', { bubbles: true, cancelable: true }));
+
+        const verifiedText = (inputField.innerText || inputField.textContent || "").trim();
+        console.log(`[${this.name}] Input field after insertion: "${verifiedText.substring(0, 80)}"`);
       } else {
-        // If there's no text but an image, ensure the input field is clear
         inputField.textContent = "";
         inputField.dispatchEvent(new Event('input', { bubbles: true }));
       }
 
-      // Paste blob if any
       if (blobToPaste) {
         const dataTransfer = new DataTransfer();
-        const file = new File([blobToPaste], "pasted_image." + (blobMimeType.split('/')[1] || 'png'), { type: blobMimeType });
+        const file = new File([blobToPaste], "image." + (blobMimeType.split('/')[1] || 'png'), { type: blobMimeType });
         dataTransfer.items.add(file);
-        const pasteEvent = new ClipboardEvent('paste', {
-          clipboardData: dataTransfer,
-          bubbles: true,
-          cancelable: true
-        });
-        inputField.dispatchEvent(pasteEvent);
-        console.log(`[${this.name}] Dispatched paste event with Blob data.`);
+        inputField.dispatchEvent(new ClipboardEvent('paste', { clipboardData: dataTransfer, bubbles: true }));
       }
-      
+
+      // 3. Polling for Send Button (Wait for it to appear/be enabled after typing)
+      let sendButton = null;
+      let buttonPollAttempts = 0;
+      const maxButtonPollAttempts = 10;
+
+      while (buttonPollAttempts < maxButtonPollAttempts) {
+        // First try specific selectors
+        let sendButtons = this._findDeep(document, this.sendButtonSelector);
+
+        // Fallback: find nearest enabled button to the input field container
+        if (sendButtons.length === 0) {
+            const inputContainer = inputField.closest('form, [class*="input"], [class*="composer"], [class*="footer"], fieldset') || inputField.parentElement;
+            if (inputContainer) {
+                const nearbyButtons = Array.from(inputContainer.querySelectorAll('button'));
+                const enabledNearby = nearbyButtons.filter(b =>
+                    !b.disabled &&
+                    b.getAttribute('aria-disabled') !== 'true' &&
+                    b.type !== 'button' || b.getAttribute('aria-label') // prefer labeled buttons
+                );
+                if (enabledNearby.length > 0) {
+                    sendButtons = enabledNearby;
+                }
+            }
+        }
+
+        if (sendButtons.length > 0) {
+            sendButton = sendButtons[sendButtons.length - 1];
+            const isDisabled = sendButton.disabled ||
+                               sendButton.getAttribute('aria-disabled') === 'true' ||
+                               sendButton.classList.contains('opacity-50') ||
+                               sendButton.classList.contains('pointer-events-none');
+
+            if (!isDisabled) {
+                console.log(`[${this.name}] Enabled send button found. aria-label: "${sendButton.getAttribute('aria-label')}"`);
+                break;
+            }
+        }
+        console.log(`[${this.name}] Waiting for send button (attempt ${buttonPollAttempts + 1}). Found: ${sendButtons.length}`);
+        // Re-dispatch input events to help UI update
+        inputField.dispatchEvent(new Event('input', { bubbles: true }));
+        await new Promise(resolve => setTimeout(resolve, 1000));
+        buttonPollAttempts++;
+      }
+
+      if (!sendButton) {
+        console.error(`[${this.name}] Send button not found or remained disabled.`);
+        this._reportSendError(requestId, "Send button not found or disabled.");
+        return false;
+      }
+
+      // 4. Click Send Button
       inputField.focus();
-      await new Promise(resolve => setTimeout(resolve, 100));
+      await new Promise(resolve => setTimeout(resolve, 300));
 
       let attempts = 0;
-      const maxAttempts = 60; // Try up to 60 times (5 minutes total)
-      const retryDelay = 5000; // 5 seconds delay between attempts
-
+      const maxAttempts = 5;
       while (attempts < maxAttempts) {
         const isDisabled = sendButton.disabled ||
                            sendButton.getAttribute('aria-disabled') === 'true' ||
-                           sendButton.classList.contains('disabled');
+                           sendButton.classList.contains('opacity-50') ||
+                           sendButton.classList.contains('pointer-events-none');
+
+        console.log(`[${this.name}] Send button check before click (attempt ${attempts + 1}). Disabled: ${isDisabled}`);
 
         if (!isDisabled) {
-          // Removed check for input field content matching lastSentMessage
-          // as it can cause issues when there are multiple messages waiting to be sent
-          console.log(`[${this.name}] Send button is enabled. Clicking send button (attempt ${attempts + 1}).`);
+          console.log(`[${this.name}] Clicking send button.`);
+          const rect = sendButton.getBoundingClientRect();
+          const clientX = rect.left + rect.width / 2;
+          const clientY = rect.top + rect.height / 2;
+
+          const options = { bubbles: true, cancelable: true, clientX, clientY, view: window };
+
+          sendButton.dispatchEvent(new PointerEvent('pointerdown', { ...options, pointerType: 'mouse' }));
+          sendButton.dispatchEvent(new MouseEvent('mousedown', options));
+          sendButton.focus();
           sendButton.click();
-          return true; // Successfully clicked
-        }
+          sendButton.dispatchEvent(new PointerEvent('pointerup', { ...options, pointerType: 'mouse' }));
+          sendButton.dispatchEvent(new MouseEvent('mouseup', options));
+          sendButton.dispatchEvent(new MouseEvent('click', options));
 
+          // Trigger Enter key as fallback after a short delay
+          setTimeout(() => {
+              const enterOptions = { key: 'Enter', code: 'Enter', keyCode: 13, which: 13, bubbles: true, cancelable: true };
+              inputField.dispatchEvent(new KeyboardEvent('keydown', enterOptions));
+              inputField.dispatchEvent(new KeyboardEvent('keypress', enterOptions));
+              inputField.dispatchEvent(new KeyboardEvent('keyup', enterOptions));
+          }, 100);
+
+          return true;
+        }
         attempts++;
-        if (attempts >= maxAttempts) {
-          console.error(`[${this.name}] Send button remained disabled after ${maxAttempts} attempts. Failed to send message.`);
-          return false; // Failed to send
-        }
-
-        console.log(`[${this.name}] Send button is disabled (attempt ${attempts}). Trying to enable and will retry in ${retryDelay}ms.`);
-        // Attempt to trigger UI updates that might enable the button
-        inputField.dispatchEvent(new Event('input', { bubbles: true })); // Re-dispatch input
+        inputField.dispatchEvent(new Event('input', { bubbles: true }));
         inputField.dispatchEvent(new Event('change', { bubbles: true }));
-        inputField.dispatchEvent(new Event('blur', { bubbles: true }));
-        // Focusing and bluring input sometimes helps enable send buttons
-        inputField.focus();
-        await new Promise(resolve => setTimeout(resolve, 50)); // Short delay for focus
-        inputField.blur();
-        
-        await new Promise(resolve => setTimeout(resolve, retryDelay));
+        await new Promise(resolve => setTimeout(resolve, 1000));
       }
-      // Should not be reached if logic is correct, but as a fallback:
-      console.error(`[${this.name}] Exited send button check loop unexpectedly.`);
+
+      this._reportSendError(requestId, "Send button remained disabled after polling.");
       return false;
     } catch (error) {
-      console.error(`[${this.name}] Error sending message to AI Studio:`, error);
+      console.error(`[${this.name}] Error sending message:`, error);
+      this._reportSendError(requestId, error.message);
       return false;
     }
   }
 
-  initiateResponseCapture(requestId, responseCallback) {
-    console.log(`[${this.name}] initiateResponseCapture called for requestId: ${requestId}. CURRENT CAPTURE METHOD IS: ${this.captureMethod}`);
+  _reportSendError(requestId, errorMessage) {
+    const callback = this.pendingResponseCallbacks.get(requestId);
+    if (callback) {
+        callback(requestId, `[PROVIDER_SEND_ERROR: ${errorMessage}]`, true);
+        this.pendingResponseCallbacks.delete(requestId);
+    }
+  }
+
+  _findDeep(root, selector) {
+    const elements = Array.from(root.querySelectorAll(selector));
+    const shadowElements = Array.from(root.querySelectorAll('*'))
+        .filter(el => el.shadowRoot)
+        .flatMap(el => this._findDeep(el.shadowRoot, selector));
+    return [...elements, ...shadowElements];
+  }
+
+  async initiateResponseCapture(requestId, responseCallback) {
+    console.log(`[${this.name}] initiateResponseCapture called for requestId: ${requestId}. Capture method: ${this.captureMethod}`);
+    this.pendingResponseCallbacks.set(requestId, responseCallback);
+
+    // Reset accumulator for this request
+    this.requestAccumulators.set(requestId, { text: "", isDefinitelyFinal: false });
+
     if (this.captureMethod === "debugger") {
-      this.pendingResponseCallbacks.set(requestId, responseCallback);
-      console.log(`[${this.name}] Stored callback for debugger response, requestId: ${requestId}`);
-    } else if (this.captureMethod === "dom") {
-      console.log(`[${this.name}] Starting DOM monitoring for requestId: ${requestId}`);
-      this.pendingResponseCallbacks.set(requestId, responseCallback);
-      this._stopDOMMonitoring(); 
-      this._startDOMMonitoring(requestId); 
+      const patterns = this.getStreamingApiPatterns();
+      await new Promise(resolve => {
+        chrome.runtime.sendMessage({
+            type: "SET_DEBUGGER_TARGETS",
+            providerName: this.name,
+            patterns: patterns
+        }, () => resolve());
+      });
+
+      if (this.domFallbackTimer) clearTimeout(this.domFallbackTimer);
+      // Start DOM monitoring after a delay to allow the message to be sent first.
+      // This avoids capturing pre-send DOM state (e.g. sidebar text).
+      this.domFallbackTimer = setTimeout(() => {
+        const acc = this.requestAccumulators.get(requestId);
+        if (acc && !acc.isDefinitelyFinal) {
+          console.log(`[${this.name}] Starting DOM monitoring for ${requestId}.`);
+          this._startDOMMonitoring(requestId);
+        }
+      }, 3000); // 3s delay gives time for message send + UI response to start
     } else {
-      console.error(`[${this.name}] Unknown capture method: ${this.captureMethod}`);
-      responseCallback(requestId, `[Error: Unknown capture method '${this.captureMethod}' in provider]`, true); 
-      this.pendingResponseCallbacks.delete(requestId); 
+      // DOM-only mode: wait 2s for send to complete and Claude to start responding
+      this.domFallbackTimer = setTimeout(() => {
+        this._startDOMMonitoring(requestId);
+      }, 2000);
     }
   }
 
   handleDebuggerData(requestId, rawData, isFinalFromBackground, errorFromBackground = null) {
-    // !!!!! VERY IMPORTANT ENTRY LOG !!!!!
-    console.log('[[ClaudeProvider]] handleDebuggerData ENTERED. RequestId: ' + requestId + ', isFinalFromBackground: ' + isFinalFromBackground + ', RawData Length: ' + (rawData ? rawData.length : 'null') + ', ErrorFromBG: ' + errorFromBackground);
-
     const callback = this.pendingResponseCallbacks.get(requestId);
+    if (!callback) return;
 
-    if (!callback) {
-      console.warn('[' + this.name + '] No pending callback for requestId: ' + requestId + '. Ignoring debugger data/error.');
-      if (this.requestBuffers.has(requestId)) {
-        this.requestBuffers.delete(requestId);
-      }
+    if (errorFromBackground) {
+      console.warn(`[${this.name}] Debugger error: ${errorFromBackground}`);
+      callback(requestId, `[Provider Error] ${errorFromBackground}`, true);
+      this.pendingResponseCallbacks.delete(requestId);
+      this.requestAccumulators.delete(requestId);
       return;
     }
 
-    if (errorFromBackground) {
-      console.warn(`[${this.name}] handleDebuggerData: Propagating error for requestId ${requestId}: ${errorFromBackground}`);
-      callback(requestId, `[Provider Error from Background] ${errorFromBackground}`, true); // Pass error as text, mark as final
-      this.pendingResponseCallbacks.delete(requestId);
-      if (this.requestBuffers.has(requestId)) {
-        this.requestBuffers.delete(requestId); // Clean up buffer too
-      }
-      return; // Stop further processing
+    let accumulator = this.requestAccumulators.get(requestId);
+    if (!accumulator) {
+      accumulator = { text: "", isDefinitelyFinal: false };
+      this.requestAccumulators.set(requestId, accumulator);
     }
 
-    if (!this.requestBuffers.has(requestId)) {
-      this.requestBuffers.set(requestId, { accumulatedText: "" });
-    }
-    const requestBuffer = this.requestBuffers.get(requestId);
-
-    let textFromCurrentChunk = "";
-    let isLogicalEndOfMessageInChunk = false;
+    if (accumulator.isDefinitelyFinal) return;
 
     if (rawData && rawData.trim() !== "") {
-      console.log('[' + this.name + '] handleDebuggerData: Processing rawData for ' + requestId + '. Accumulated before: ' + requestBuffer.accumulatedText.length);
-      const parseOutput = this.parseDebuggerResponse(rawData, requestId);
-      
-      textFromCurrentChunk = parseOutput.text;
-      isLogicalEndOfMessageInChunk = parseOutput.isFinalResponse;
+        const parseOutput = this.parseDebuggerResponse(rawData, requestId);
 
-      if (textFromCurrentChunk) {
-        requestBuffer.accumulatedText += textFromCurrentChunk;
-      }
-      console.log('[' + this.name + '] handleDebuggerData: Parsed chunk for ' + requestId + '. TextInChunk: ' + (textFromCurrentChunk ? textFromCurrentChunk.substring(0,50) : 'N/A') + '..., LogicalEndInChunk: ' + isLogicalEndOfMessageInChunk + '. Accumulated after: ' + requestBuffer.accumulatedText.length);
-    } else {
-      console.log('[' + this.name + '] handleDebuggerData: Received empty/whitespace rawData for ' + requestId + '. isFinalFromBackground: ' + isFinalFromBackground + '. Accumulated: ' + requestBuffer.accumulatedText.length);
+        if (accumulator.text.length === 0 && parseOutput.text) {
+          console.log(`[${this.name}] SUCCESS: First debugger data received for ${requestId}. Disabling DOM fallback timer.`);
+          if (this.domFallbackTimer) {
+              clearTimeout(this.domFallbackTimer);
+              this.domFallbackTimer = null;
+          }
+        }
+
+        if (parseOutput.text) {
+            accumulator.text += parseOutput.text;
+        }
+
+        if (parseOutput.isFinalResponse) {
+            // Only finalize if we have text. If text is empty but it's "final",
+            // it might mean the debugger missed the data chunks but got the stop signal.
+            // In that case, we let DOM fallback handle it.
+            if (accumulator.text.length > 0) {
+                accumulator.isDefinitelyFinal = true;
+            } else {
+                console.log(`[${this.name}] Received final signal but text is empty. Waiting for potential more chunks or DOM fallback.`);
+            }
+        }
+
+        // Only callback if we have text or it's definitely final
+        if (accumulator.text.length > 0 || accumulator.isDefinitelyFinal) {
+            callback(requestId, accumulator.text, accumulator.isDefinitelyFinal);
+        }
+    } else if (isFinalFromBackground) {
+        console.log(`[${this.name}] Debugger signal: final from background for ${requestId}. Acc len: ${accumulator.text.length}`);
+
+        // If we have some text, we can finalize.
+        if (accumulator.text.length > 0) {
+            accumulator.isDefinitelyFinal = true;
+            callback(requestId, accumulator.text, true);
+        } else {
+            // Debugger finished with NO text. This is a failure of the debugger method.
+            // We DO NOT mark as final here; instead, we let the DOM fallback timer
+            // (which was set in initiateResponseCapture) trigger _startDOMMonitoring.
+            console.log(`[${this.name}] Debugger finished with NO text. Relying on DOM fallback.`);
+        }
     }
 
-    const shouldSendFinalResponse = isLogicalEndOfMessageInChunk || (isFinalFromBackground && !isLogicalEndOfMessageInChunk);
-
-    console.log('[' + this.name + '] handleDebuggerData: Eval for ' + requestId + '. LogicalEnd: ' + isLogicalEndOfMessageInChunk + ', isFinalBG: ' + isFinalFromBackground + ', includeThinking: ' + this.includeThinkingInMessage + ', AccLen: ' + requestBuffer.accumulatedText.length + '. ShouldSendFinal: ' + shouldSendFinalResponse);
-
-    if (shouldSendFinalResponse) {
-      console.log('[' + this.name + '] handleDebuggerData: FINAL RESPONSE condition met for ' + requestId + '. Sending full accumulated text. Length: ' + requestBuffer.accumulatedText.length);
-      callback(requestId, requestBuffer.accumulatedText, true);
+    if (accumulator.isDefinitelyFinal) {
       this.pendingResponseCallbacks.delete(requestId);
-      this.requestBuffers.delete(requestId);
-    } else if (this.includeThinkingInMessage && textFromCurrentChunk) {
-        console.log('[' + this.name + '] handleDebuggerData: Sending INTERMEDIATE chunk for ' + requestId + '. Text: ' + (textFromCurrentChunk ? textFromCurrentChunk.substring(0,50) : 'N/A') + '...');
-        callback(requestId, textFromCurrentChunk, false);
-    } else {
-        console.log('[' + this.name + '] handleDebuggerData: Not sending response for ' + requestId + ' YET.');
+      this.requestAccumulators.delete(requestId);
     }
   }
 
-  // --- START OF CLAUDE SSE DEBUGGER PARSING LOGIC ---
-  parseDebuggerResponse(sseChunk, requestIdForLog = 'unknown') {
-    // console.log('[' + this.name + '] Parsing Claude SSE chunk for reqId ' + requestIdForLog + ' (first 300): ' + (sseChunk ? sseChunk.substring(0, 300) : "null"));
-    let extractedTextThisChunk = "";
-    let isEndOfMessageEventInThisChunk = false;
-    const sseMessages = sseChunk.split('\n\n');
+  parseDebuggerResponse(sseChunk, requestId = 'unknown') {
+    let extractedText = "";
+    let isFinal = false;
 
-    for (const sseMessage of sseMessages) {
-        if (sseMessage.trim() === "") continue;
+    // Check for non-SSE content
+    const trimmed = sseChunk.trim();
+    if (trimmed.startsWith('import ') || trimmed.startsWith('export ') || trimmed.startsWith('function(') || trimmed.length > 50000) { // Increased limit
+        return { text: "", isFinalResponse: false };
+    }
+
+    const messages = sseChunk.split('\n\n');
+    for (const msg of messages) {
+        if (!msg.trim()) continue;
 
         let eventType = null;
-        let jsonDataString = null;
-        const lines = sseMessage.split('\n');
+        let dataStr = null;
+        const lines = msg.split('\n');
 
         for (const line of lines) {
-            if (line.startsWith("event:")) {
-                eventType = line.substring("event:".length).trim();
-            } else if (line.startsWith("data:")) {
-                jsonDataString = line.substring("data:".length).trim();
-            }
+            if (line.startsWith("event:")) eventType = line.substring(6).trim();
+            else if (line.startsWith("data:")) dataStr = line.substring(5).trim();
         }
-        
+
         if (eventType === "message_stop") {
-            console.log('[' + this.name + '] ReqId ' + requestIdForLog + ' - Event: "message_stop" detected. Marking EOM.');
-            isEndOfMessageEventInThisChunk = true;
-        } else if (eventType && jsonDataString) {
+            isFinal = true;
+        } else if (eventType && dataStr) {
             try {
-                const dataObject = JSON.parse(jsonDataString);
-                if (eventType === "content_block_delta") {
-                    if (dataObject.delta && dataObject.delta.type === "text_delta" && typeof dataObject.delta.text === 'string') {
-                        extractedTextThisChunk += dataObject.delta.text;
-                    }
-                } else if (eventType === "message_delta") {
-                    if (dataObject.delta && dataObject.delta.stop_reason) {
-                        console.log('[' + this.name + '] ReqId ' + requestIdForLog + ' - Event: "message_delta" with stop_reason: ' + dataObject.delta.stop_reason + '. Marking EOM.');
-                        isEndOfMessageEventInThisChunk = true;
-                    }
+                const data = JSON.parse(dataStr);
+                if (eventType === "content_block_delta" && data.delta?.text) {
+                    extractedText += data.delta.text;
+                } else if (eventType === "message_delta" && data.delta?.stop_reason) {
+                    isFinal = true;
                 }
             } catch (e) {
-                console.warn('[' + this.name + '] ReqId ' + requestIdForLog + ' - Error parsing JSON from Claude SSE event \'' + eventType + '\':', e, "JSON Data:", jsonDataString);
+                // Ignore parse errors for partial/malformed JSON in stream
             }
         }
     }
-    // console.log('[' + this.name + '] parseDebuggerResponse for reqId ' + requestIdForLog + ' result: Text: "' + (extractedTextThisChunk ? extractedTextThisChunk.substring(0,50) : "N/A") + '...", isEOM: ' + isEndOfMessageEventInThisChunk);
-    return { text: extractedTextThisChunk, isFinalResponse: isEndOfMessageEventInThisChunk };
+    return { text: extractedText, isFinalResponse: isFinal };
   }
-  // --- END OF CLAUDE SSE DEBUGGER PARSING LOGIC ---
 
-  formatOutput(thinkingText, answerText) {
-    if (this.includeThinkingInMessage && thinkingText && thinkingText.trim() !== "") {
-        try {
-            const result = {
-                thinking: thinkingText.trim(),
-                answer: (answerText || "").trim()
-            };
-            return JSON.stringify(result);
-        } catch (e) {
-            console.error(`[${this.name}] Error stringifying thinking/answer object:`, e);
-            return (answerText || "").trim();
-        }
-    }
-    return (answerText || "").trim();
-  }
-  
-  // --- Other methods (DOM fallback, etc. - largely unchanged but included for completeness) ---
-   _captureResponseDOM(element = null) {
-    console.log(`[${this.name}] _captureResponseDOM (DOM method) called with element:`, element);
-    if (!element && this.captureMethod === "dom") {
-        const elements = document.querySelectorAll(this.responseSelector);
-        if (elements.length > 0) {
-            element = elements[elements.length - 1];
-            console.log(`[${this.name}] _captureResponseDOM: Found element via querySelector during polling.`);
-        }
-    }
+  _captureResponseDOM(element = null) {
     if (!element) {
-      console.log(`[${this.name}] _captureResponseDOM: No element provided or found.`);
-      return { found: false, text: '' };
+        const sentTrimmed = this.lastSentMessage.trim();
+        // Use the LAST user-message element so that in multi-turn conversations
+        // we walk siblings from the most recent user turn, not the first one.
+        const allUserMsgEls = document.querySelectorAll('[data-testid="user-message"]');
+        const userMsgEl = allUserMsgEls.length > 0 ? allUserMsgEls[allUserMsgEls.length - 1] : null;
+
+        if (userMsgEl) {
+            // Walk up from the user-message until we find an ancestor that has
+            // a SUBSEQUENT sibling containing substantial non-user text.
+            // The timestamp "12:00 PM" is a direct sibling at low levels — we need
+            // to go higher until the sibling is the full assistant turn.
+            let node = userMsgEl;
+            for (let depth = 0; depth < 15; depth++) {
+                const parent = node.parentElement;
+                if (!parent) break;
+
+                // Check all next siblings of node at this level
+                let sib = node.nextElementSibling;
+                while (sib) {
+                    const sibText = (sib.innerText || sib.textContent || "").trim();
+                    // Must be substantial text, not a timestamp (< 10 chars), not user message echo
+                    if (sibText.length > 30 && !sibText.startsWith(sentTrimmed)) {
+                        element = sib;
+                        console.log(`[${this.name}] Found assistant turn at depth ${depth}, text: "${sibText.substring(0, 80)}"`);
+                        break;
+                    }
+                    sib = sib.nextElementSibling;
+                }
+                if (element) break;
+                node = parent;
+            }
+        }
+
+        if (!element) {
+            // Last resort: find any element in the page that has the action-bar-copy/retry
+            // buttons as children — those only appear on completed messages
+            const retryBtns = Array.from(document.querySelectorAll('[data-testid="action-bar-retry"]'));
+            if (retryBtns.length > 0) {
+                // The retry button's grandparent or similar should be the assistant message
+                let candidate = retryBtns[retryBtns.length - 1];
+                for (let i = 0; i < 6; i++) {
+                    candidate = candidate.parentElement;
+                    if (!candidate) break;
+                    const t = (candidate.innerText || candidate.textContent || "").trim();
+                    if (t.length > 50 && !t.startsWith(sentTrimmed)) {
+                        element = candidate;
+                        console.log(`[${this.name}] Found assistant turn via retry button ancestor. Text: "${t.substring(0, 80)}"`);
+                        break;
+                    }
+                }
+            }
+        }
+
+        if (!element) {
+            return { found: false, text: '', isStillGenerating: this._isGenerating() };
+        }
     }
-    if (this._isResponseStillGeneratingDOM()) {
-      console.log(`[${this.name}] Response is still being generated (_isResponseStillGeneratingDOM check), waiting for completion`);
-      return { found: false, text: '' };
+
+    // Clean up the captured text
+    const sentTrimmed = this.lastSentMessage.trim();
+    let text = (element.innerText || element.textContent || "").trim();
+
+    // Strip user message echo if it appears at the start
+    if (sentTrimmed && text.startsWith(sentTrimmed)) {
+        text = text.slice(sentTrimmed.length).trim();
     }
-    console.log(`[${this.name}] Attempting to capture DOM response from Claude...`);
-    let responseText = "";
-    let foundResponse = false;
-    try {
-      // Simplified DOM capture for Claude - assumes response is in a known container
-      // This part would need to be specific to Claude's DOM structure if DOM capture is used.
-      // For now, focusing on debugger method.
-      const responseElements = document.querySelectorAll(this.responseSelectorForDOMFallback); // Use appropriate selector
-      if (responseElements.length > 0) {
-          const lastResponseElement = responseElements[responseElements.length -1];
-          // Check if it's a model response and not user input etc.
-          // This is highly dependent on Claude's actual DOM structure.
-          // Example:
-          // if (lastResponseElement.closest('.message-row[data-role="assistant"]')) {
-          //    responseText = lastResponseElement.textContent.trim();
-          //    foundResponse = true;
-          // }
-          responseText = lastResponseElement.textContent.trim(); // Placeholder
-          if (responseText && responseText !== this.lastSentMessage) {
-              foundResponse = true;
-          }
-      }
-      if (!foundResponse) {
-        console.log("CLAUDE (DOM): Response not found yet.");
-      }
-    } catch (error) {
-      console.error("CLAUDE (DOM): Error capturing response:", error);
+
+    // Strip known Claude UI prefix labels
+    text = text.replace(/^Claude responded:\s*/i, '').trim();
+    text = text.replace(/^Claude\s*\n/i, '').trim();
+    text = text.replace(/^(Haiku|Sonnet|Opus|Claude)\s[\d.]+\s*\n/i, '').trim();
+
+    // Deduplicate repeated paragraphs (artifact of capturing a wider container):
+    // Split on double newlines and remove any paragraph that is identical to the next one
+    const paras = text.split('\n\n');
+    const deduped = paras.filter((para, i) => i === 0 || para.trim() !== paras[i - 1].trim());
+    text = deduped.join('\n\n').trim();
+
+    const isStillGenerating = this._isGenerating();
+    if (text.length > 0) {
+        console.log(`[${this.name}] _captureResponseDOM: text length=${text.length}, generating=${isStillGenerating}, preview="${text.substring(0, 80)}"`);
     }
-     if (foundResponse && responseText) {
-      responseText = responseText.trim()
-        .replace(/^(Loading|Thinking).*/gim, '') // General cleanup
-        .replace(/\n{3,}/g, '\n\n')
-        .trim();
-    }
-    return {
-      found: foundResponse && !!responseText.trim(),
-      text: responseText
-    };
+
+    return { found: text.length > 0, text, isStillGenerating };
   }
 
-  _findResponseElementDOM(container) {
-    console.log(`[${this.name}] _findResponseElementDOM called on container:`, container);
-    if (!container) return null;
+  _isGenerating() {
+    // Claude shows a "Stop response" button only while streaming.
+    // Also check for streaming cursor/animation elements.
+    const stopButtons = Array.from(document.querySelectorAll('button[aria-label*="Stop" i]'));
+    const stopVisible = stopButtons.some(btn => btn.offsetParent !== null && btn.offsetWidth > 0);
+    if (stopVisible) return true;
 
-    const elements = container.querySelectorAll(this.responseSelectorForDOMFallback);
-    if (elements.length > 0) {
-      const lastElement = elements[elements.length - 1];
-      console.log(`[${this.name}] Found last response element via DOM:`, lastElement);
-      // Add checks to ensure it's not the user's input or an old response
-      if (lastElement.textContent && lastElement.textContent.trim() !== this.lastSentMessage) {
-        return lastElement;
-      }
-    }
-    console.log(`[${this.name}] No suitable response element found via DOM in container.`);
-    return null;
-  }
-
-  shouldSkipResponseMonitoring() {
-    // Example: if a provider indicates via a specific property or method
-    // For CLAUDE, if using debugger, we don't need DOM monitoring.
-    // This method is more for providers that might sometimes use DOM, sometimes not.
-    // console.log(`[${this.name}] shouldSkipResponseMonitoring called. Capture method: ${this.captureMethod}`);
-    return this.captureMethod === "debugger";
-  }
-
-  _isResponseStillGeneratingDOM() {
-    // This is for the DOM fallback method
-    const thinkingIndicator = document.querySelector(this.thinkingIndicatorSelectorForDOM);
-    if (thinkingIndicator) {
-      // console.log(`[${this.name}] DOM Fallback: Thinking indicator found.`);
-      return true;
-    }
-    // console.log(`[${this.name}] DOM Fallback: No thinking indicator found.`);
-    return false;
+    // Secondary check: look for streaming cursor or animation
+    const streamingIndicators = document.querySelectorAll(
+        '.streaming-cursor, [class*="cursor-blink"], [class*="streaming"], .loading-dots'
+    );
+    return streamingIndicators.length > 0;
   }
 
   getStreamingApiPatterns() {
-    console.log(`[${this.name}] getStreamingApiPatterns called. Capture method: ${this.captureMethod}`);
-    if (this.captureMethod === "debugger" && this.debuggerUrlPattern) {
-      console.log(`[${this.name}] Using debugger URL pattern: ${this.debuggerUrlPattern}`);
-      return [{ urlPattern: this.debuggerUrlPattern }];
+    return [
+        { urlPattern: this.debuggerUrlPattern, requestStage: "Response" },
+        { urlPattern: "*://claude.ai/api/organizations/*/conversations/*/completion*", requestStage: "Response" },
+        { urlPattern: "*/api/*/conversations/*/completion*", requestStage: "Response" },
+        { urlPattern: "*completion*", requestStage: "Response" },
+        { urlPattern: "*conversations*", requestStage: "Response" }
+    ];
+  }
+
+  shouldSkipResponseMonitoring() {
+    return false; // We want DOM monitoring to be active as fallback
+  }
+
+  stopStreaming(requestId) {
+    console.log(`[${this.name}] stopStreaming called for ${requestId}`);
+    const callback = this.pendingResponseCallbacks.get(requestId);
+    if (callback) {
+      const acc = this.requestAccumulators.get(requestId);
+      callback(requestId, (acc ? acc.text : "") + "[STREAM_STOPPED_BY_USER]", true);
     }
-    console.log(`[${this.name}] No debugger patterns to return (captureMethod is not 'debugger' or no pattern set).`);
-    return [];
+    this.pendingResponseCallbacks.delete(requestId);
+    this.requestAccumulators.delete(requestId);
+    this._stopDOMMonitoring();
   }
 
   _startDOMMonitoring(requestId) {
-    console.log(`[${this.name}] DOM Fallback: _startDOMMonitoring for requestId: ${requestId}`);
-    this._stopDOMMonitoring(); // Stop any existing observer
+    console.log(`[${this.name}] Starting DOM monitoring for requestId: ${requestId}`);
+    this._stopDOMMonitoring();
 
-    const callback = this.pendingResponseCallbacks.get(requestId);
-    if (!callback) {
-      console.error(`[${this.name}] DOM Fallback: No callback for requestId ${requestId} in _startDOMMonitoring.`);
-      return;
-    }
+    let lastCapturedText = "";
+    let noChangeCount = 0;
+    let totalChecks = 0;
+    let generationStarted = false; // Track whether we've seen the Stop button appear
+    const maxNoChange = 6;   // Finalize after 6s of stable text once generation stopped
+    const maxTotalChecks = 90; // Hard cap: 90 seconds total
 
-    let attempts = 0;
-    const maxAttempts = 15; // Try for ~15 seconds
-    const interval = 1000;
-
-    this.domMonitorTimer = setInterval(() => {
-      console.log(`[${this.name}] DOM Fallback: Polling attempt ${attempts + 1}/${maxAttempts} for requestId: ${requestId}`);
-      const responseData = this._captureResponseDOM(); // Will use this.responseSelectorForDOMFallback
-
-      if (responseData.found && responseData.text.trim() !== "") {
-        console.log(`[${this.name}] DOM Fallback: Response captured for requestId ${requestId}. Text (first 100): ${responseData.text.substring(0,100)}`);
-        this._stopDOMMonitoring();
-        callback(requestId, responseData.text, true); // Assume final for DOM capture
-        this.pendingResponseCallbacks.delete(requestId);
-      } else {
-        attempts++;
-        if (attempts >= maxAttempts) {
-          console.warn(`[${this.name}] DOM Fallback: Max attempts reached for requestId ${requestId}. No response captured.`);
-          this._stopDOMMonitoring();
-          callback(requestId, "[Error: Timed out waiting for DOM response]", true); // Error, final
-          this.pendingResponseCallbacks.delete(requestId);
+    const monitor = () => {
+        const callback = this.pendingResponseCallbacks.get(requestId);
+        if (!callback) {
+            this._stopDOMMonitoring();
+            return;
         }
-      }
-    }, interval);
-    console.log(`[${this.name}] DOM Fallback: Monitoring started with timer ID ${this.domMonitorTimer}`);
+
+        totalChecks++;
+
+        const isGenerating = this._isGenerating();
+        if (isGenerating) generationStarted = true;
+
+        const result = this._captureResponseDOM();
+        if (result.found) {
+            if (result.text !== lastCapturedText) {
+                lastCapturedText = result.text;
+                noChangeCount = 0;
+                callback(requestId, result.text, false);
+            } else {
+                noChangeCount++;
+            }
+        }
+
+        // Finish conditions:
+        // 1. Generation was seen to start AND stopped, text stable for 2s
+        // 2. Generation never seen (very fast response) — text stable for 3s after monitor start
+        // 3. Text hasn't changed for maxNoChange seconds regardless
+        // 4. Hard timeout
+        const stoppedGenerating = generationStarted && !isGenerating && lastCapturedText.length > 0 && noChangeCount >= 2;
+        const fastResponse = !generationStarted && lastCapturedText.length > 0 && noChangeCount >= 3 && totalChecks >= 5;
+        const noChangeTimeout = lastCapturedText.length > 0 && noChangeCount >= maxNoChange;
+        const hardTimeout = totalChecks >= maxTotalChecks;
+        const shouldFinalize = stoppedGenerating || fastResponse || noChangeTimeout || hardTimeout;
+
+        if (shouldFinalize) {
+            const reason = stoppedGenerating ? 'generating_stopped' : fastResponse ? 'fast_response' : noChangeTimeout ? 'no_change_timeout' : 'hard_timeout';
+            console.log(`[${this.name}] DOM monitoring finishing for ${requestId}. Reason: ${reason}. Text len: ${lastCapturedText.length}`);
+            if (lastCapturedText.length > 0) {
+                callback(requestId, lastCapturedText, true);
+            } else {
+                callback(requestId, "[Error: No response captured from DOM]", true);
+            }
+            this.pendingResponseCallbacks.delete(requestId);
+            this._stopDOMMonitoring();
+        } else {
+            this.domMonitorTimer = setTimeout(monitor, 1000);
+        }
+    };
+    this.domMonitorTimer = setTimeout(monitor, 1000); // Start 1s after monitoring begins
   }
 
   _stopDOMMonitoring() {
     if (this.domMonitorTimer) {
-      console.log(`[${this.name}] DOM Fallback: Stopping DOM monitoring timer ID ${this.domMonitorTimer}`);
-      clearInterval(this.domMonitorTimer);
+      clearTimeout(this.domMonitorTimer);
       this.domMonitorTimer = null;
     }
   }
 }
 
-// Ensure the provider is available on the window for the content script
-if (window.providerUtils) {
-  const providerInstance = new ClaudeProvider();
-  window.providerUtils.registerProvider(
-    providerInstance.name,
-    providerInstance.supportedDomains,
-    providerInstance
-  );
-} else {
-  console.error("CLAUDE: providerUtils not found. Registration failed.");
-}
+// Robust registration
+(function register() {
+    if (window.providerUtils) {
+        console.log("ClaudeProvider: Registering...");
+        const providerInstance = new ClaudeProvider();
+        window.providerUtils.registerProvider(providerInstance.name, providerInstance.supportedDomains, providerInstance);
+        console.log("ClaudeProvider: Registered successfully.");
+    } else {
+        console.log("ClaudeProvider: Waiting for providerUtils...");
+        setTimeout(register, 500);
+    }
+})();

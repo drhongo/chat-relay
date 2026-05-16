@@ -1,7 +1,7 @@
 {
   "manifest_version": 3,
   "name": "AI Chat Relay",
-  "version": "1.0",
+  "version": "1.1",
   "description": "Relays messages between an OpenAI-compatible API server and chat interfaces",
   "permissions": [
     "scripting",

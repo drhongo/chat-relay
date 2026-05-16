@@ -21,191 +21,206 @@ class ChatGptProvider {
   constructor() {
     // --- START OF CONFIGURABLE PROPERTIES ---
     this.captureMethod = "debugger"; // Default value
-    this.debuggerUrlPattern = "*chatgpt.com/backend-api/conversation*";
-    this.includeThinkingInMessage = true;
+    this.debuggerUrlPattern = "*://chatgpt.com/*"; // Broadened to catch all variations
+    this.includeThinkingInMessage = false;
     // --- END OF CONFIGURABLE PROPERTIES ---
     this.name = "ChatGptProvider";
     this.supportedDomains = ["chatgpt.com"];
     this.inputSelector = '#prompt-textarea';
-    this.sendButtonSelector = 'button[data-testid="send-button"]'; // Use data-testid
-    this.responseSelector = '.message-bubble .text-content';
-    this.thinkingIndicatorSelector = '.loading-spinner';
-    this.responseSelectorForDOMFallback = '.message-container .response-text';
-    this.thinkingIndicatorSelectorForDOM = '.thinking-dots, .spinner-animation';
+    this.sendButtonSelector = 'button[data-testid="send-button"], [aria-label="Send prompt"], button[class*="bottom-1.5"], button.bg-black, .flex.items-end button';
+    this.responseSelector = '[data-message-author-role="assistant"] div.markdown, .markdown.prose, .message-bubble .text-content';
+    this.thinkingIndicatorSelector = '.loading-spinner, [data-testid="stop-button"], .typing-indicator';
+    this.responseSelectorForDOMFallback = '[data-message-author-role="assistant"] div.markdown';
+    this.thinkingIndicatorSelectorForDOM = '.loading-spinner, .blue-circle';
+    this.newChatSelector = 'a[data-testid="sidebar-new-chat-button"], button[data-testid="sidebar-new-chat-button"], nav a[href="/"], .new-chat-button, button[aria-label="New chat" i], [aria-label="New chat" i], button[aria-label*="New chat" i], a[aria-label*="New chat" i], [data-testid$="new-chat-button"]';
     this.lastSentMessage = '';
     this.pendingResponseCallbacks = new Map();
     this.requestAccumulators = new Map();
     this.domMonitorTimer = null;
+    this.domFallbackTimeout = 15000; // Increased to 15s to allow for slow LLM starts and debugger lag
+    this.domFallbackTimer = null;
 
-    // This is now an async constructor, which is not ideal but necessary here.
-    // The registration in the main script will need to handle the promise.
-    return (async () => {
-      await this._loadSettings();
-      console.log(`[${this.name}] Provider initialized for domains: ${this.supportedDomains.join(', ')}`);
-      return this;
-    })();
+    this._loadSettings();
+    console.log(`[${this.name}] Provider initialized for domains: ${this.supportedDomains.join(', ')}`);
   }
 
   _loadSettings() {
-    return new Promise((resolve) => {
-      chrome.storage.sync.get({ chatGptCaptureMethod: 'debugger' }, (items) => {
-        this.captureMethod = items.chatGptCaptureMethod;
-        console.log(`[${this.name}] Capture method set to: ${this.captureMethod}`);
-        resolve();
-      });
+    chrome.storage.sync.get({ chatGptCaptureMethod: 'debugger' }, (items) => {
+      this.captureMethod = items.chatGptCaptureMethod;
+      console.log(`[${this.name}] Capture method updated to: ${this.captureMethod}`);
     });
   }
 
-  async sendChatMessage(messageContent, requestId) { // Changed parameter name
-    console.log(`[${this.name}] sendChatMessage called for requestId ${requestId} with content type:`, typeof messageContent, Array.isArray(messageContent) ? `Array length: ${messageContent.length}` : '');
+  async sendChatMessage(messageContent, messageOrId) {
+    const requestId = typeof messageOrId === 'object' ? messageOrId.requestId : messageOrId;
+    console.log(`[${this.name}] sendChatMessage called for requestId ${requestId}`);
     const MAX_RETRIES = 5;
-    const RETRY_DELAY_MS_BASE = 250;
-
-    // --- 1. Find and check the input field ---
+    
     const inputField = document.querySelector(this.inputSelector);
     if (!inputField) {
-      console.error(`[${this.name}] Input field (selector: ${this.inputSelector}) not found for requestId ${requestId}.`);
+      console.error(`[${this.name}] Input field not found: ${this.inputSelector}`);
       this._reportSendError(requestId, `Input field not found: ${this.inputSelector}`);
       return false;
     }
-    if (inputField.disabled || inputField.hasAttribute('disabled')) {
-      console.warn(`[${this.name}] Input field (selector: ${this.inputSelector}) is disabled for requestId ${requestId}.`);
-      this._reportSendError(requestId, `Input field is disabled: ${this.inputSelector}`);
-      return false;
-    }
 
-    // --- 2. Prepare and set content ONCE ---
     try {
       let textToInput = "";
-      let blobToPaste = null;
-      let blobMimeType = "image/png"; // Default
-
       if (typeof messageContent === 'string') {
         textToInput = messageContent;
-        this.lastSentMessage = textToInput;
-        console.log(`[${this.name}] Handling string content for requestId ${requestId}:`, textToInput.substring(0, 70) + "...");
-      } else if (messageContent instanceof Blob) {
-        blobToPaste = messageContent;
-        blobMimeType = messageContent.type || blobMimeType;
-        this.lastSentMessage = `Blob data (type: ${blobMimeType}, size: ${blobToPaste.size}) for requestId ${requestId}`;
-        console.log(`[${this.name}] Handling Blob content for requestId ${requestId}. Size: ${blobToPaste.size}, Type: ${blobMimeType}`);
       } else if (Array.isArray(messageContent)) {
-        console.log(`[${this.name}] Handling array content for requestId ${requestId}.`);
-        for (const part of messageContent) {
-          if (part.type === "text" && typeof part.text === 'string') {
-            textToInput += (textToInput ? "\n" : "") + part.text;
-          } else if (part.type === "image_url" && part.image_url && typeof part.image_url.url === 'string') {
-            if (!blobToPaste) { // Prioritize the first image
-              try {
-                const response = await fetch(part.image_url.url);
-                blobToPaste = await response.blob();
-                blobMimeType = blobToPaste.type || blobMimeType;
-                console.log(`[${this.name}] Fetched image_url as Blob for requestId ${requestId}. Size: ${blobToPaste.size}, Type: ${blobMimeType}`);
-              } catch (e) {
-                console.error(`[${this.name}] Error fetching image_url ${part.image_url.url} for requestId ${requestId}:`, e);
-                // Optionally report error and return false if image is critical
+        textToInput = messageContent.map(p => p.text || "").join("\n");
+      }
+      
+      this.lastSentMessage = textToInput;
+
+      // Handle New Chat request
+      if (typeof messageOrId === 'object' && messageOrId.settings && messageOrId.settings.new_chat) {
+          console.log(`[${this.name}] New Chat requested. Current path: ${window.location.pathname}`);
+
+          // Even if we are on / or /chat, we might want to click New Chat to ensure a fresh session
+          const newChatButton = document.querySelector(this.newChatSelector);
+          if (newChatButton) {
+              console.log(`[${this.name}] Found New Chat button, clicking...`);
+              const rect = newChatButton.getBoundingClientRect();
+              const clientX = rect.left + rect.width / 2;
+              const clientY = rect.top + rect.height / 2;
+
+              newChatButton.dispatchEvent(new PointerEvent('pointerdown', { bubbles: true, pointerType: 'mouse', clientX, clientY }));
+              newChatButton.dispatchEvent(new MouseEvent('mousedown', { bubbles: true, clientX, clientY }));
+              newChatButton.focus();
+              newChatButton.dispatchEvent(new PointerEvent('pointerup', { bubbles: true, pointerType: 'mouse', clientX, clientY }));
+              newChatButton.dispatchEvent(new MouseEvent('mouseup', { bubbles: true, clientX, clientY }));
+              newChatButton.click();
+
+              await new Promise(resolve => setTimeout(resolve, 2500));
+          } else {
+              console.warn(`[${this.name}] New Chat button not found via primary selector. Searching by text...`);
+              const allElements = document.querySelectorAll('button, a, div[role="button"], span');
+              let foundElement = null;
+              for (const el of allElements) {
+                  const text = el.textContent.toLowerCase().trim();
+                  const aria = (el.getAttribute('aria-label') || "").toLowerCase();
+                  if (text === 'new chat' || text === 'chatgpt' || aria.includes('new chat')) {
+                      console.log(`[${this.name}] Found potential New Chat element by text/aria:`, el.tagName, text, aria);
+                      foundElement = el;
+                      break;
+                  }
               }
-            } else {
-              console.warn(`[${this.name}] Multiple image_urls found for requestId ${requestId}, only the first will be processed.`);
+
+              if (foundElement) {
+                  const rect = foundElement.getBoundingClientRect();
+                  const clientX = rect.left + rect.width / 2;
+                  const clientY = rect.top + rect.height / 2;
+
+                  foundElement.dispatchEvent(new PointerEvent('pointerdown', { bubbles: true, pointerType: 'mouse', clientX, clientY }));
+                  foundElement.dispatchEvent(new MouseEvent('mousedown', { bubbles: true, clientX, clientY }));
+                  foundElement.focus();
+                  foundElement.dispatchEvent(new PointerEvent('pointerup', { bubbles: true, pointerType: 'mouse', clientX, clientY }));
+                  foundElement.dispatchEvent(new MouseEvent('mouseup', { bubbles: true, clientX, clientY }));
+                  foundElement.click();
+
+                  await new Promise(resolve => setTimeout(resolve, 2500));
+              } else if (window.location.pathname !== "/" && window.location.pathname !== "/chat") {
+                  console.log(`[${this.name}] No button found, but not on homepage. Navigating to /...`);
+                  window.location.href = "/";
+                  await new Promise(resolve => setTimeout(resolve, 4000));
+              }
+          }
+      }
+
+      // Re-find the input field to avoid "Stale Element" references after navigation/New Chat
+      const activeInputField = document.querySelector(this.inputSelector);
+      if (!activeInputField) {
+          throw new Error(`Prompt input field '${this.inputSelector}' not found.`);
+      }
+
+      activeInputField.focus();
+      
+      // Clear field and insert text
+      if (activeInputField.tagName === 'TEXTAREA' || activeInputField.tagName === 'INPUT') {
+          activeInputField.value = '';
+          activeInputField.value = textToInput;
+      } else {
+          document.execCommand('selectAll', false, null);
+          document.execCommand('delete', false, null);
+          activeInputField.dispatchEvent(new InputEvent('beforeinput', { bubbles: true, cancelable: true, inputType: 'insertText', data: textToInput }));
+          document.execCommand('insertText', false, textToInput);
+          
+          if (activeInputField.innerText.trim() === "" && textToInput.trim() !== "") {
+            console.log(`[${this.name}] execCommand failed, falling back to innerText`);
+            activeInputField.innerText = textToInput;
+          }
+      }
+
+      // Trigger multiple events to satisfy React/Next.js state
+      const events = ['input', 'change', 'keyup', 'keydown'];
+      events.forEach(type => {
+          activeInputField.dispatchEvent(new Event(type, { bubbles: true, cancelable: true }));
+      });
+      
+      await new Promise(resolve => setTimeout(resolve, 1000)); 
+
+      for (let attempt = 0; attempt < MAX_RETRIES; attempt++) {
+        const sendButton = document.querySelector(this.sendButtonSelector);
+        if (sendButton) {
+          const isDisabled = sendButton.disabled || 
+                             sendButton.getAttribute('aria-disabled') === 'true' ||
+                             sendButton.classList.contains('disabled');
+          
+          if (!isDisabled) {
+            console.log(`[${this.name}] Attempting to click send button on attempt ${attempt + 1}`);
+            
+            // Human-like click sequence
+            const rect = sendButton.getBoundingClientRect();
+            const clientX = rect.left + rect.width / 2;
+            const clientY = rect.top + rect.height / 2;
+            
+            sendButton.dispatchEvent(new PointerEvent('pointerdown', { bubbles: true, cancelable: true, pointerType: 'mouse', clientX, clientY }));
+            sendButton.dispatchEvent(new MouseEvent('mousedown', { bubbles: true, cancelable: true, clientX, clientY }));
+            sendButton.focus();
+            sendButton.dispatchEvent(new PointerEvent('pointerup', { bubbles: true, cancelable: true, pointerType: 'mouse', clientX, clientY }));
+            sendButton.dispatchEvent(new MouseEvent('mouseup', { bubbles: true, cancelable: true, clientX, clientY }));
+            sendButton.click();
+            
+            // Final blur to trigger any pending state updates
+            activeInputField.blur();
+            
+            // Wait to see if it worked (input should clear)
+            await new Promise(resolve => setTimeout(resolve, 500));
+            let currentContent = (activeInputField.value || activeInputField.innerText || "").trim();
+            if (currentContent === "") {
+                console.log(`[${this.name}] Message sent successfully (input cleared via button).`);
+                return true;
+            }
+
+            // If button didn't work quickly, try Enter key right away
+            console.log(`[${this.name}] Button click didn't clear input, trying Enter key...`);
+            activeInputField.dispatchEvent(new KeyboardEvent('keydown', { key: 'Enter', code: 'Enter', keyCode: 13, which: 13, bubbles: true, cancelable: true }));
+            activeInputField.dispatchEvent(new KeyboardEvent('keypress', { key: 'Enter', code: 'Enter', keyCode: 13, which: 13, bubbles: true, cancelable: true }));
+            
+            await new Promise(resolve => setTimeout(resolve, 500));
+            currentContent = (activeInputField.value || activeInputField.innerText || "").trim();
+            if (currentContent === "") {
+                console.log(`[${this.name}] Message sent successfully (input cleared via Enter fallback).`);
+                return true;
             }
           }
         }
-        this.lastSentMessage = `Array content (Text: "${textToInput.substring(0,50)}...", Image: ${blobToPaste ? 'Yes' : 'No'}) for requestId ${requestId}`;
-      } else {
-        console.error(`[${this.name}] Unhandled message content type: ${typeof messageContent} for requestId ${requestId}. Cannot send.`);
-        this.lastSentMessage = `Unhandled data type: ${typeof messageContent}`;
-        this._reportSendError(requestId, `Unhandled message content type: ${typeof messageContent}`);
-        return false;
+        
+        console.warn(`[${this.name}] Send attempt ${attempt + 1} failed to clear input.`);
+        activeInputField.dispatchEvent(new Event('input', { bubbles: true }));
+        await new Promise(resolve => setTimeout(resolve, 500));
       }
 
-      // Set text input if any
-      if (textToInput) {
-        inputField.innerText = textToInput; // Use .innerText for contenteditable div
-        console.log(`[${this.name}] Set inputField.innerText for requestId ${requestId}.`);
-      } else {
-        inputField.innerText = ""; // Clear if only image or no text
-        console.log(`[${this.name}] Cleared inputField.innerText (no text part) for requestId ${requestId}.`);
-      }
-      inputField.dispatchEvent(new Event('input', { bubbles: true, cancelable: true }));
-      
-      // Paste blob if any
-      if (blobToPaste) {
-        const dataTransfer = new DataTransfer();
-        const file = new File([blobToPaste], "pasted_image." + (blobMimeType.split('/')[1] || 'png'), { type: blobMimeType });
-        dataTransfer.items.add(file);
-        const pasteEvent = new ClipboardEvent('paste', {
-          clipboardData: dataTransfer,
-          bubbles: true,
-          cancelable: true
-        });
-        inputField.dispatchEvent(pasteEvent);
-        console.log(`[${this.name}] Dispatched paste event with Blob data for requestId ${requestId}.`);
-      }
-
-      inputField.focus();
-      await new Promise(resolve => setTimeout(resolve, 750)); // Delay for UI to update after content set
+      // Final failure
+      this._reportSendError(requestId, "All send attempts (button and Enter key) failed to clear input.");
+      return false;
 
     } catch (error) {
-      console.error(`[${this.name}] Error during content preparation for requestId ${requestId}:`, error);
-      this._reportSendError(requestId, `Exception during content preparation: ${error.message}`);
+      console.error(`[${this.name}] Error in sendChatMessage:`, error);
+      this._reportSendError(requestId, error.message);
       return false;
     }
-
-    // --- 3. Retry loop for finding and clicking the send button ---
-    for (let attempt = 0; attempt < MAX_RETRIES; attempt++) {
-      const currentDelay = RETRY_DELAY_MS_BASE + (attempt * 100);
-      if (attempt > 0) await new Promise(resolve => setTimeout(resolve, currentDelay)); // No delay on first attempt of this loop
-
-      try {
-        const sendButton = document.querySelector(this.sendButtonSelector);
-        if (!sendButton) {
-          console.error(`[${this.name}] Send button (selector: ${this.sendButtonSelector}) not found on attempt ${attempt + 1} for requestId ${requestId}.`);
-          if (attempt === MAX_RETRIES - 1) {
-            this._reportSendError(requestId, `Send button not found: ${this.sendButtonSelector}`);
-            return false;
-          }
-          continue;
-        }
-
-        const isDisabled = sendButton.disabled ||
-                           sendButton.hasAttribute('disabled') ||
-                           sendButton.getAttribute('aria-disabled') === 'true' ||
-                           sendButton.classList.contains('disabled');
-
-        console.log(`[${this.name}] Attempt ${attempt + 1} for requestId ${requestId} (Send Button Loop): Selector: '${this.sendButtonSelector}', Found: ${!!sendButton}, Disabled: ${isDisabled}, aria-disabled: ${sendButton.getAttribute('aria-disabled')}`);
-
-        if (!isDisabled) {
-          console.log(`[${this.name}] Clicking send button (selector: ${this.sendButtonSelector}) on attempt ${attempt + 1} for requestId ${requestId}.`);
-          sendButton.click();
-          console.log(`[${this.name}] Send button clicked for requestId ${requestId}. Returning true.`);
-          return true;
-        } else {
-          console.warn(`[${this.name}] Send button (selector: ${this.sendButtonSelector}) is disabled on attempt ${attempt + 1} for requestId ${requestId}.`);
-          
-          // If button is disabled, try to trigger UI updates that might enable it
-          // These events are on inputField as they might influence the button's state
-          inputField.dispatchEvent(new Event('input', { bubbles: true, cancelable: true }));
-          inputField.dispatchEvent(new Event('change', { bubbles: true, cancelable: true }));
-          inputField.focus(); // Re-focus input field
-          await new Promise(resolve => setTimeout(resolve, 50)); // Short delay
-
-          if (attempt === MAX_RETRIES - 1) {
-            console.error(`[${this.name}] Send button still disabled on final attempt for requestId ${requestId}. Selectors: Input='${this.inputSelector}', Button='${this.sendButtonSelector}'.`);
-            this._reportSendError(requestId, `Send button remained disabled after ${MAX_RETRIES} attempts: ${this.sendButtonSelector}`);
-            return false;
-          }
-        }
-      } catch (error) {
-        console.error(`[${this.name}] Error during send button click attempt ${attempt + 1} for requestId ${requestId}:`, error);
-        if (attempt === MAX_RETRIES - 1) {
-          this._reportSendError(requestId, `Exception during send button click: ${error.message}`);
-          return false;
-        }
-        // Continue to next attempt if error is not on the last attempt
-      }
-    }
-    this._reportSendError(requestId, `Exhausted all retries for sendChatMessage (send button loop) for requestId ${requestId}.`);
-    return false;
   }
 
   _reportSendError(requestId, errorMessage) {
@@ -220,47 +235,68 @@ class ChatGptProvider {
       }
   }
 
-  initiateResponseCapture(requestId, responseCallback) {
+  async initiateResponseCapture(requestId, responseCallback) {
     console.log(`[${this.name}] initiateResponseCapture called for requestId: ${requestId}. Capture method: ${this.captureMethod}`);
     this.pendingResponseCallbacks.set(requestId, responseCallback);
-    if (this.captureMethod === "websocket") {
-      console.log(`[${this.name}] WebSocket capture selected. Storing callback and waiting for proxy to be ready for requestId: ${requestId}.`);
-      
-      // Wait for the proxy to announce it's ready, then send the requestId
-      const sendRequestId = () => {
-        console.log(`[${this.name}] Proxy is ready. Sending requestId ${requestId}.`);
-        const event = new CustomEvent('chatRelay-setWebsocketRequestId', { detail: { requestId } });
-        window.dispatchEvent(event);
-      };
 
-      // The proxy might already be ready, so we check for a flag or just try to send.
-      // A more robust way is to listen for the ready signal.
-      window.addEventListener('chatRelay-proxyReady', sendRequestId, { once: true });
-    } else if (this.captureMethod === "debugger") {
-      console.log(`[${this.name}] Debugger capture selected. Callback stored for requestId: ${requestId}. Ensure background script is set up for '${this.debuggerUrlPattern}'.`);
-    } else if (this.captureMethod === "dom") {
-      console.log(`[${this.name}] DOM capture selected. Starting DOM monitoring for requestId: ${requestId}`);
-      this._stopDOMMonitoring();
-      this._startDOMMonitoring(requestId);
+    // Reset accumulator for this request
+    this.requestAccumulators.set(requestId, { text: "", isDefinitelyFinal: false, currentProcessingStage: undefined });
+
+    if (this.captureMethod === "debugger") {
+      console.log(`[${this.name}] Debugger capture initiated. Requesting debugger attachment.`);
+
+      // Use specific patterns instead of the broad one to avoid intercepting all site traffic
+      const patterns = this.getStreamingApiPatterns();
+      if (patterns.length === 0) {
+          patterns.push({ urlPattern: this.debuggerUrlPattern });
+      }
+
+      await new Promise(resolve => {
+        chrome.runtime.sendMessage({
+            type: "SET_DEBUGGER_TARGETS",
+            providerName: this.name,
+            patterns: patterns
+        }, response => {
+            console.log(`[${this.name}] SET_DEBUGGER_TARGETS response:`, response);
+            resolve();
+        });
+      });
+
+      console.log(`[${this.name}] Debugger capture initiated with ${patterns.length} patterns. Setting DOM fallback timer for ${this.domFallbackTimeout}ms.`);
+      
+      // Clear any existing fallback timer
+      if (this.domFallbackTimer) clearTimeout(this.domFallbackTimer);
+      
+      this.domFallbackTimer = setTimeout(() => {
+        const acc = this.requestAccumulators.get(requestId);
+        if (acc && acc.text.length === 0) {
+          console.warn(`[${this.name}] No data received via debugger after ${this.domFallbackTimeout}ms. Falling back to DOM capture.`);
+          this._startDOMMonitoring(requestId);
+        } else {
+          console.log(`[${this.name}] Debugger already has data (${acc ? acc.text.length : 0} chars). No DOM fallback needed.`);
+        }
+      }, this.domFallbackTimeout);
     } else {
-      console.error(`[${this.name}] Unknown capture method: ${this.captureMethod}`);
-      responseCallback(requestId, `[Error: Unknown capture method '${this.captureMethod}' in provider]`, true);
-      this.pendingResponseCallbacks.delete(requestId);
+      this._startDOMMonitoring(requestId);
     }
   }
 
   handleDebuggerData(requestId, rawData, isFinalFromBackground) {
-    console.log(`[${this.name}] handleDebuggerData ENTER - requestId: ${requestId}, isFinalFromBackground: ${isFinalFromBackground}, rawData: "${rawData ? rawData.substring(0,150) + (rawData.length > 150 ? "..." : "") : "null/empty"}"`);
+    // Only log at debug level or if it's likely a real response chunk
+    const isSSE = rawData && rawData.includes("data:");
+    
     const callback = this.pendingResponseCallbacks.get(requestId);
     if (!callback) {
-      console.warn(`[${this.name}] handleDebuggerData - No callback for requestId: ${requestId}. RawData: ${rawData ? rawData.substring(0,50) : "null"}`);
+      if (isSSE) {
+        console.log(`[${this.name}] handleDebuggerData - No active callback for requestId: ${requestId} but received SSE data. This might be a late chunk.`);
+      }
       return;
     }
+    
     let accumulator = this.requestAccumulators.get(requestId);
     if (!accumulator) {
       accumulator = { text: "", isDefinitelyFinal: false, currentProcessingStage: undefined }; // Initialize stage
       this.requestAccumulators.set(requestId, accumulator);
-      console.log(`[${this.name}] handleDebuggerData - Initialized new accumulator for ${requestId}: ${JSON.stringify(accumulator)}`);
     }
     console.log(`[${this.name}] handleDebuggerData - Accumulator state for ${requestId} BEFORE processing: ${JSON.stringify(accumulator)}`);
 
@@ -285,6 +321,13 @@ class ChatGptProvider {
         // Ignore
       } else {
           const parseOutput = this.parseDebuggerResponse(rawData, accumulator.currentProcessingStage);
+          if (accumulator.text.length === 0 && (parseOutput.text || parseOutput.operation === "replace")) {
+            console.log(`[${this.name}] SUCCESS: First debugger data received for ${requestId}. Disabling DOM fallback timer.`);
+            if (this.domFallbackTimer) {
+                clearTimeout(this.domFallbackTimer);
+                this.domFallbackTimer = null;
+            }
+          }
           accumulator.currentProcessingStage = parseOutput.newProcessingStage; // Update stage
           console.log(`[${this.name}] handleDebuggerData - requestId: ${requestId}, parseOutput: ${JSON.stringify(parseOutput)}`);
           
@@ -306,6 +349,14 @@ class ChatGptProvider {
           
           // Invoke callback if there's new text, or if it's final, or if it was a replace operation (even with empty string)
           if (parseOutput.text !== null || accumulator.isDefinitelyFinal || parseOutput.operation === "replace") {
+            // Safety: Don't send a FINAL empty response unless it's a definitive [DONE] or we've tried for a while.
+            // If it's final but text is empty, and we are NOT seeing the [DONE] marker, maybe wait.
+            if (accumulator.isDefinitelyFinal && accumulator.text.trim() === "" && !rawData.includes("[DONE]")) {
+                console.log(`[${this.name}] handleDebuggerData - Received 'final' signal but text is empty and no [DONE] marker. Keeping request alive.`);
+                accumulator.isDefinitelyFinal = false; // Reset finality to keep waiting
+                return;
+            }
+
             console.log(`[${this.name}] handleDebuggerData - INVOKING CALLBACK for ${requestId}. Text: "${accumulator.text.substring(0,100)}...", isFinal: ${accumulator.isDefinitelyFinal}, Stage: ${accumulator.currentProcessingStage}`);
             callback(requestId, accumulator.text, accumulator.isDefinitelyFinal);
           }
@@ -517,11 +568,13 @@ class ChatGptProvider {
                 }
                  console.log(`[${this.name}] parseDebuggerResponse - Patch applied. currentLineText: "${currentLineText.substring(0,50)}...", currentLineIsReplaceOp: ${currentLineIsReplaceOperation}`);
               }
-              // Finality from patch metadata
-              if ((patch.p === "/message/metadata/finish_details/type" && patch.v === "stop") ||
-                  (patch.p === "/message/metadata/finish_reason" && patch.v === "stop") ||
+              // Finality from patch metadata - be careful not to trigger prematurely on intermediate signals
+              if (((patch.p === "/message/metadata/finish_details/type" || patch.p === "/message/metadata/finish_reason") && patch.v === "stop") ||
                   (patch.p === "/message/status" && patch.v === "finished_successfully")) {
-                isFinalResponse = true;
+                // Only consider it final from metadata if we've actually started receiving content
+                if (newProcessingStage === "processing_content") {
+                    isFinalResponse = true;
+                }
               }
             }
           }
@@ -601,16 +654,54 @@ class ChatGptProvider {
           console.log(`[${this.name}] parseDebuggerResponse - After line processing. textForThisChunk: "${textForThisChunk ? textForThisChunk.substring(0,70) : "null"}...", chunkOverallOperation: ${chunkOverallOperation}`);
 
           // General finality checks
-          if (messageNode) {
+          if (messageNode && newProcessingStage === "processing_content") {
             if (messageNode.metadata && messageNode.metadata.finish_details && messageNode.metadata.finish_details.type === "stop") isFinalResponse = true;
             if (messageNode.status === "finished_successfully" && messageNode.end_turn === true) isFinalResponse = true;
           }
           if (data.choices && data.choices[0] && data.choices[0].finish_reason === 'stop') isFinalResponse = true;
+          
+          // Support for data.completions array (observed in some models/responses)
+          if (Array.isArray(data.completions) && data.completions.length > 0) {
+              const completion = data.completions[0];
+              if (typeof completion === 'string') {
+                  currentLineText = completion;
+                  currentLineIsReplaceOperation = true; // completions array usually contains full text or large chunks
+                  console.log(`[${this.name}] parseDebuggerResponse - completions[0] string. currentLineText: "${currentLineText.substring(0,50)}..."`);
+              } else if (typeof completion === 'object' && completion !== null && typeof completion.text === 'string') {
+                  currentLineText = completion.text;
+                  currentLineIsReplaceOperation = completion.operation === 'replace';
+                  console.log(`[${this.name}] parseDebuggerResponse - completions[0].text. currentLineText: "${currentLineText.substring(0,50)}..."`);
+              }
+          }
 
         } catch (e) { console.warn(`[${this.name}] parseDebuggerResponse - Error parsing dataJson from line: '${line}'. dataJson: '${dataJson}'. Error:`, e); }
       } else if (line.trim() === "" || line.startsWith("event:") || line.startsWith("id:")) {
         continue;
-      } else if (line.trim()) { console.warn(`[${this.name}] parseDebuggerResponse - Unexpected non-data SSE line: ${line}`); }
+      } else if (line.trim()) {
+        // Try to parse as raw JSON if it doesn't have the data: prefix
+        try {
+            const potentialJson = JSON.parse(line.trim());
+            if (potentialJson && typeof potentialJson === 'object') {
+                // It's a valid JSON control message (like the conduit_token one)
+                // We don't need to do anything with it yet, but we shouldn't warn
+                continue;
+            }
+        } catch (e) {
+            // Check if it's likely JavaScript or other non-SSE content
+            const trimmedLine = line.trim();
+            if (trimmedLine.startsWith('import ') ||
+                trimmedLine.startsWith('export ') ||
+                trimmedLine.startsWith('function(') ||
+                trimmedLine.includes('react.memo_cache_sentinel') ||
+                trimmedLine.length > 500) { // Likely minified JS or large binary chunk
+                // Silently skip likely non-SSE content
+                continue;
+            }
+
+            // Not JSON either, so warn
+            console.warn(`[${this.name}] parseDebuggerResponse - Unexpected non-data SSE line: ${line.substring(0, 100)}${line.length > 100 ? '...' : ''}`);
+        }
+      }
     }
     console.log(`[${this.name}] parseDebuggerResponse FINISHING. Returning: text: "${textForThisChunk ? textForThisChunk.substring(0,100) + "..." : "null"}", isFinal: ${isFinalResponse}, operation: "${chunkOverallOperation}", newStage: ${newProcessingStage}`);
     return { text: textForThisChunk, isFinalResponse: isFinalResponse, operation: chunkOverallOperation, newProcessingStage };
@@ -633,16 +724,33 @@ class ChatGptProvider {
   }
 
   _captureResponseDOM(element = null) {
-    if (!element && this.captureMethod === "dom") {
-        const elements = document.querySelectorAll(this.responseSelector);
-        if (elements.length > 0) {
-            element = elements[elements.length - 1];
+    if (!element) {
+        // Broaden search to ensure we get the latest assistant message specifically
+        const assistantMessages = document.querySelectorAll('[data-message-author-role="assistant"]');
+        if (assistantMessages.length > 0) {
+            // Pick the latest one
+            const lastAssistantMessage = assistantMessages[assistantMessages.length - 1];
+            // Look for the markdown container inside it
+            element = lastAssistantMessage.querySelector('div.markdown') || lastAssistantMessage;
+        } else {
+            // Fallback to general response selectors
+            const elements = document.querySelectorAll(this.responseSelector);
+            if (elements.length > 0) {
+                element = elements[elements.length - 1];
+            }
         }
     }
     if (!element) {
         return { text: null, isStillGenerating: false };
     }
+
     let responseText = element.innerText || element.textContent || "";
+
+    // Log for debugging mismatch
+    if (responseText.length > 0) {
+        console.log(`[${this.name}] DOM capture found text length: ${responseText.length}. Sample: "${responseText.substring(0, 30)}..."`);
+    }
+
     if (this.lastSentMessage && responseText.trim().startsWith(this.lastSentMessage.trim())) {
         const potentialActualResponse = responseText.substring(this.lastSentMessage.length).trim();
         if (potentialActualResponse === "") {
@@ -660,6 +768,17 @@ class ChatGptProvider {
   }
 
   _isResponseStillGeneratingDOM() {
+    // If the send button is visible and NOT disabled, we are definitely NOT generating.
+    const sendButton = document.querySelector(this.sendButtonSelector);
+    if (sendButton) {
+        const isDisabled = sendButton.disabled || 
+                           sendButton.getAttribute('aria-disabled') === 'true' ||
+                           sendButton.classList.contains('disabled');
+        if (!isDisabled) {
+            return false; // Send button is ready, so we must be done.
+        }
+    }
+
     if (this.thinkingIndicatorSelector && document.querySelector(this.thinkingIndicatorSelector)) {
         return true;
     }
@@ -733,8 +852,10 @@ class ChatGptProvider {
   getStreamingApiPatterns() {
     if (this.captureMethod === "debugger") {
       return [
-        { urlPattern: "*chatgpt.com/backend-api/conversation*", requestStage: "Response" },
-        { urlPattern: "*chatgpt.com/backend-api/f/conversation*", requestStage: "Response" }
+        { urlPattern: "*://chatgpt.com/backend-api/conversation*", requestStage: "Response" },
+        { urlPattern: "*://chatgpt.com/backend-api/f/conversation*", requestStage: "Response" },
+        { urlPattern: "*://chat.openai.com/backend-api/conversation*", requestStage: "Response" },
+        { urlPattern: "*conversation*", requestStage: "Response" }
       ];
     }
     // For websocket method, we don't need to return any patterns as we are not using the debugger.
@@ -783,14 +904,13 @@ class ChatGptProvider {
 }
 
 if (window.providerUtils && window.providerUtils.registerProvider) {
-  new ChatGptProvider().then(providerInstance => {
-    window.providerUtils.registerProvider(
-      providerInstance.name,
-      providerInstance.supportedDomains,
-      providerInstance
-    );
-    console.log(`[${providerInstance.name}] Provider registered with providerUtils.`);
-  });
+  const providerInstance = new ChatGptProvider();
+  window.providerUtils.registerProvider(
+    providerInstance.name,
+    providerInstance.supportedDomains,
+    providerInstance
+  );
+  console.log(`[${providerInstance.name}] Provider registered with providerUtils.`);
 } else {
   console.error("[ChatGptProvider] providerUtils not found. Registration failed. Ensure provider-utils.js is loaded before chatgpt.js");
 }

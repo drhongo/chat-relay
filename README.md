@@ -126,7 +126,9 @@ An optional developer utility server for simulating messages, testing extensions
 ```bash
 cd api-relay-server
 npm install
-nodemon start
+npm run dev
+# Only on Windows:
+npm start
 ```
 
 ### Browser Extension Setup
@@ -163,7 +165,7 @@ npm install -g C:/Users/user/Projects/chat-relay/mcp-server/chat-relay-mcp-0.0.1
 ### Configuring Cline/RooCode
 
 1. Open settings → API Provider: OpenAI Compatible  
-2. Base URL: `http://localhost:3003`  
+2. Base URL: `http://localhost:3003/v1` (or just `http://localhost:3003`)
 3. API Key: Any value (not validated)
 4. Model ID: `gemini-pro`, `chatgpt`, `claude-3-sonnet`, or any label
 
