@@ -127,6 +127,8 @@ An optional developer utility server for simulating messages, testing extensions
 cd api-relay-server
 npm install
 npm run dev
+# Only on Windows:
+npm start
 ```
 
 ### Browser Extension Setup
