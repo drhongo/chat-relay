@@ -42,10 +42,10 @@ class ClaudeProvider {
     this.newChatSelector = '[data-testid*="new-chat"], a[href="/new"], [aria-label*="New chat" i], [aria-label*="Start a new chat" i]';
 
     // Updated response selectors based on the actual elements
-    this.responseSelector = '.font-claude-message, [data-testid="message-container"], .model-response, .model-response-container, ms-chat-turn, .very-large-text-container, .cmark-node, .claude-message';
+    this.responseSelector = '.font-claude-response-body, .standard-markdown, [data-testid="assistant-message"], .font-claude-message, [data-testid="message-container"], .model-response, .model-response-container, ms-chat-turn, .very-large-text-container, .cmark-node, .claude-message, div.prose';
 
     // Thinking indicator selector
-    this.thinkingIndicatorSelector = '.thinking-indicator, .loading-indicator, .typing-indicator, .response-loading, .loading, [aria-label*="Stop" i]';
+    this.thinkingIndicatorSelector = '.thinking-indicator, .loading-indicator, .typing-indicator, .response-loading, .loading, [aria-label*="Stop" i], [data-testid="stop-button"], button[aria-label*="Stop"]';
 
     // Fallback selectors
     this.responseSelectorForDOMFallback = '.font-claude-message, [data-testid="message-container"], .claude-message';
@@ -536,11 +536,20 @@ class ClaudeProvider {
                 let sib = node.nextElementSibling;
                 while (sib) {
                     const sibText = (sib.innerText || sib.textContent || "").trim();
-                    // Must be substantial text, not a timestamp (< 10 chars), not user message echo
-                    if (sibText.length > 30 && !sibText.startsWith(sentTrimmed)) {
-                        element = sib;
-                        console.log(`[${this.name}] Found assistant turn at depth ${depth}, text: "${sibText.substring(0, 80)}"`);
-                        break;
+                    const isTimestamp = /^(\d{1,2}:\d{2})\s?([APM]{2})?$/i.test(sibText);
+                    
+                    // Must be non-empty, not a timestamp, and not user message echo
+                    if (sibText.length > 0 && !isTimestamp && !sibText.startsWith(sentTrimmed)) {
+                        // Prioritize if it has a known response class
+                        const hasResponseClass = sib.querySelector('.font-claude-response-body, .standard-markdown') || 
+                                               sib.classList.contains('font-claude-response-body') ||
+                                               sib.classList.contains('standard-markdown');
+                        
+                        if (hasResponseClass || !element) {
+                            element = sib;
+                            console.log(`[${this.name}] Found assistant turn at depth ${depth}, text: "${sibText.substring(0, 80)}"`);
+                            if (hasResponseClass) break; // Found the high-quality match
+                        }
                     }
                     sib = sib.nextElementSibling;
                 }
@@ -560,9 +569,27 @@ class ClaudeProvider {
                     candidate = candidate.parentElement;
                     if (!candidate) break;
                     const t = (candidate.innerText || candidate.textContent || "").trim();
-                    if (t.length > 50 && !t.startsWith(sentTrimmed)) {
+                    const isTimestamp = /^(\d{1,2}:\d{2})\s?([APM]{2})?$/i.test(t);
+                    if (t.length > 0 && !isTimestamp && !t.startsWith(sentTrimmed)) {
                         element = candidate;
                         console.log(`[${this.name}] Found assistant turn via retry button ancestor. Text: "${t.substring(0, 80)}"`);
+                        break;
+                    }
+                }
+            }
+        }
+
+        if (!element) {
+            // Absolute last resort: just find the last element matching our primary response selectors
+            const candidates = this._findDeep(document, this.responseSelector);
+            if (candidates.length > 0) {
+                // Pick the last one that isn't the user message or a timestamp
+                for (let i = candidates.length - 1; i >= 0; i--) {
+                    const t = (candidates[i].innerText || candidates[i].textContent || "").trim();
+                    const isTimestamp = /^(\d{1,2}:\d{2})\s?([APM]{2})?$/i.test(t);
+                    if (t.length > 0 && !isTimestamp && !t.startsWith(sentTrimmed)) {
+                        element = candidates[i];
+                        console.log(`[${this.name}] Found assistant turn via primary selector fallback. Text: "${t.substring(0, 80)}"`);
                         break;
                     }
                 }
@@ -578,21 +605,13 @@ class ClaudeProvider {
     const sentTrimmed = this.lastSentMessage.trim();
     let text = (element.innerText || element.textContent || "").trim();
 
+    // CLEANUP: Strip Claude UI noise
+    text = this._cleanResponse(text);
+
     // Strip user message echo if it appears at the start
     if (sentTrimmed && text.startsWith(sentTrimmed)) {
         text = text.slice(sentTrimmed.length).trim();
     }
-
-    // Strip known Claude UI prefix labels
-    text = text.replace(/^Claude responded:\s*/i, '').trim();
-    text = text.replace(/^Claude\s*\n/i, '').trim();
-    text = text.replace(/^(Haiku|Sonnet|Opus|Claude)\s[\d.]+\s*\n/i, '').trim();
-
-    // Deduplicate repeated paragraphs (artifact of capturing a wider container):
-    // Split on double newlines and remove any paragraph that is identical to the next one
-    const paras = text.split('\n\n');
-    const deduped = paras.filter((para, i) => i === 0 || para.trim() !== paras[i - 1].trim());
-    text = deduped.join('\n\n').trim();
 
     const isStillGenerating = this._isGenerating();
     if (text.length > 0) {
@@ -600,6 +619,38 @@ class ClaudeProvider {
     }
 
     return { found: text.length > 0, text, isStillGenerating };
+  }
+
+  // Helper to strip Claude's UI-specific labels and boilerplate
+  _cleanResponse(text) {
+      if (!text) return "";
+      
+      let cleaned = text;
+
+      // 1. Strip known Claude UI prefix labels
+      cleaned = cleaned.replace(/^Claude responded:\s*/i, '').trim();
+      cleaned = cleaned.replace(/^Claude\s*\n/i, '').trim();
+      cleaned = cleaned.replace(/^(Haiku|Sonnet|Opus|Claude)\s[\d.]+\s*\n/i, '').trim();
+
+      // 2. Remove footers/disclaimers
+      const footers = [
+          /Claude is AI and can make mistakes\./gi,
+          /Please double-check responses\./gi,
+          /Check for accuracy\./gi,
+          /Subscribe to Pro for/gi,
+          /Claude [\d.]+ (Haiku|Sonnet|Opus)/gi
+      ];
+
+      footers.forEach(regex => {
+          cleaned = cleaned.replace(regex, "");
+      });
+
+      // 3. Deduplicate repeated paragraphs
+      const paras = cleaned.split('\n\n');
+      const deduped = paras.filter((para, i) => i === 0 || para.trim() !== paras[i - 1].trim());
+      cleaned = deduped.join('\n\n').trim();
+
+      return cleaned.trim();
   }
 
   _isGenerating() {
@@ -642,7 +693,7 @@ class ClaudeProvider {
     this._stopDOMMonitoring();
   }
 
-  _startDOMMonitoring(requestId) {
+  async _startDOMMonitoring(requestId) {
     console.log(`[${this.name}] Starting DOM monitoring for requestId: ${requestId}`);
     this._stopDOMMonitoring();
 
@@ -650,8 +701,9 @@ class ClaudeProvider {
     let noChangeCount = 0;
     let totalChecks = 0;
     let generationStarted = false; // Track whether we've seen the Stop button appear
-    const maxNoChange = 6;   // Finalize after 6s of stable text once generation stopped
-    const maxTotalChecks = 90; // Hard cap: 90 seconds total
+    
+    // Initial delay to allow Claude to process the send and show generating state
+    await new Promise(resolve => setTimeout(resolve, 2000));
 
     const monitor = () => {
         const callback = this.pendingResponseCallbacks.get(requestId);
@@ -678,13 +730,13 @@ class ClaudeProvider {
 
         // Finish conditions:
         // 1. Generation was seen to start AND stopped, text stable for 2s
-        // 2. Generation never seen (very fast response) — text stable for 3s after monitor start
-        // 3. Text hasn't changed for maxNoChange seconds regardless
+        // 2. Generation never seen (very fast response) — text stable for 4s after monitor start
+        // 3. Text hasn't changed for 10s regardless
         // 4. Hard timeout
         const stoppedGenerating = generationStarted && !isGenerating && lastCapturedText.length > 0 && noChangeCount >= 2;
-        const fastResponse = !generationStarted && lastCapturedText.length > 0 && noChangeCount >= 3 && totalChecks >= 5;
-        const noChangeTimeout = lastCapturedText.length > 0 && noChangeCount >= maxNoChange;
-        const hardTimeout = totalChecks >= maxTotalChecks;
+        const fastResponse = !generationStarted && lastCapturedText.length > 0 && noChangeCount >= 4 && totalChecks >= 6;
+        const noChangeTimeout = lastCapturedText.length > 0 && noChangeCount >= 10;
+        const hardTimeout = totalChecks >= 120;
         const shouldFinalize = stoppedGenerating || fastResponse || noChangeTimeout || hardTimeout;
 
         if (shouldFinalize) {
@@ -698,10 +750,10 @@ class ClaudeProvider {
             this.pendingResponseCallbacks.delete(requestId);
             this._stopDOMMonitoring();
         } else {
-            this.domMonitorTimer = setTimeout(monitor, 1000);
+            this.domMonitorTimer = setTimeout(monitor, 500); // Poll every 500ms
         }
     };
-    this.domMonitorTimer = setTimeout(monitor, 1000); // Start 1s after monitoring begins
+    monitor();
   }
 
   _stopDOMMonitoring() {

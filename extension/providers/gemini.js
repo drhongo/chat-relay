@@ -177,12 +177,15 @@ class GeminiProvider {
     }
   }
 
-  _startDOMMonitoring(requestId) {
+  async _startDOMMonitoring(requestId) {
     console.log(`[${this.name}] Starting DOM monitoring for requestId: ${requestId}.`);
     let lastCapturedText = "";
     let noChangeStreak = 0;
     let checkCount = 0;
     
+    // Small initial delay to allow Gemini UI to show the "Stop" button or generating indicator
+    await new Promise(resolve => setTimeout(resolve, 1500));
+
     const monitor = () => {
         checkCount++;
         const callback = this.pendingResponseCallbacks.get(requestId);
@@ -204,17 +207,21 @@ class GeminiProvider {
             noChangeStreak++;
         }
 
-        if (!isStillGenerating && noChangeStreak >= 5 && lastCapturedText.trim() !== "") {
+        // Only mark final if we are NOT generating AND we have a stable response
+        // Increase streak requirement for short responses to avoid premature cutoffs
+        const requiredStreak = lastCapturedText.length < 50 ? 10 : 5;
+        if (!isStillGenerating && noChangeStreak >= requiredStreak && lastCapturedText.trim() !== "") {
             isFinalDOMResponse = true;
         }
 
-        // If we've been waiting for 10 seconds and have NO text and NO generating signal, assume something is wrong and finish
-        if (!isStillGenerating && noChangeStreak >= 20 && lastCapturedText.trim() === "") {
-            console.log(`[${this.name}] No text found after 10s of polling and no generating signal. Finishing.`);
+        // If we've been waiting for a while and have NO text and NO generating signal, assume something is wrong and finish
+        if (!isStillGenerating && noChangeStreak >= 20 && lastCapturedText.trim() === "" && checkCount > 10) {
+            console.log(`[${this.name}] No text found after polling and no generating signal. Finishing.`);
             isFinalDOMResponse = true;
         }
         
-        if (checkCount > 60) isFinalDOMResponse = true;
+        // Safety timeout (approx 30s)
+        if (checkCount > 120) isFinalDOMResponse = true;
 
         if (isFinalDOMResponse) {
             console.log(`[${this.name}] DOM monitoring finished for ${requestId}. Final length: ${lastCapturedText.length}`);
@@ -222,10 +229,10 @@ class GeminiProvider {
             this.pendingResponseCallbacks.delete(requestId);
             this._stopDOMMonitoring();
         } else {
-            this.domMonitorTimer = setTimeout(monitor, 500); 
+            this.domMonitorTimer = setTimeout(monitor, 250); // Poll faster for smoother updates
         }
     };
-    this.domMonitorTimer = setTimeout(monitor, 100); 
+    monitor();
   }
 
   _stopDOMMonitoring() {
@@ -251,43 +258,55 @@ class GeminiProvider {
     // Try primary and fallback selectors with shadow piercing
     let responseElements = findDeep(document, this.responseSelector);
 
-    // Filter out elements that are likely part of the "Welcome/Home" screen chips
-    responseElements = responseElements.filter(el => {
+    // Filter out elements that are likely part of the "Welcome/Home" screen chips or sidebar
+    const isExcluded = (el) => {
         const text = el.innerText || "";
         // Gemini welcome screen often contains these strings
         if (text.includes("Create image") || text.includes("Help me learn") || text.includes("Boost my day") || text.includes("Create music")) {
-            return false;
+            return true;
         }
-        return true;
-    });
+        // Exclude sidebar/history items specifically
+        if (el.closest('nav, [role="navigation"], .sidebar, .chat-history, [id*="history"]')) {
+            return true;
+        }
+        // Exclude very short snippets that look like titles
+        if (text.length < 20 && responseElements.length > 1) {
+            return true;
+        }
+        return false;
+    };
+
+    responseElements = responseElements.filter(el => !isExcluded(el));
 
     console.log(`[${this.name}] Primary search found ${responseElements.length} elements.`);
 
     if (responseElements.length === 0) {
         responseElements = findDeep(document, 'message-content, .model-response-text, .markdown, .response-container');
-        // Apply same filter
-        responseElements = responseElements.filter(el => {
-            const text = el.innerText || "";
-            return !(text.includes("Create image") || text.includes("Help me learn") || text.includes("Boost my day") || text.includes("Create music"));
-        });
+        responseElements = responseElements.filter(el => !isExcluded(el));
         console.log(`[${this.name}] Fallback search found ${responseElements.length} elements.`);
     }
 
     // Final desperate search - only if we didn't find anything and we are SURE we're not on the home page suggestions
     if (responseElements.length === 0) {
         responseElements = findDeep(document, 'div').filter(el => {
-            const text = el.innerText || "";
+            const text = (el.innerText || "").trim();
             const isHomeSuggestion = text.includes("Create image") || text.includes("Help me learn") || text.includes("Boost my day") || text.includes("Create music");
             // Also filter out standard UI labels
-            const isUILabel = text.trim() === "Gemini" || text.trim() === "Enter a prompt here";
+            const isUILabel = text === "Gemini" || text === "Enter a prompt here" || text === "New chat";
+            
+            // Check for sidebar again in desperate search
+            const isSidebar = el.closest('nav, [role="navigation"], .sidebar, .chat-history, [id*="history"], .chat-title');
 
-            return text.length > 50 && !isHomeSuggestion && !isUILabel && !el.querySelector('textarea') && !el.closest('sidebar, .sidebar');
+            return text.length > 50 && !isHomeSuggestion && !isUILabel && !isSidebar && !el.querySelector('textarea') && !el.querySelector('input');
         });
         console.log(`[${this.name}] Desperate search found ${responseElements.length} elements.`);
     }
 
     const lastResponse = responseElements[responseElements.length - 1];
     let text = lastResponse ? (lastResponse.innerText || lastResponse.textContent || "").trim() : "";
+
+    // CLEANUP: Strip Gemini UI noise
+    text = this._cleanResponse(text);
 
     // Safety check: if text exactly matches the prompt, it might be the user message echoing back
     if (this.lastSentMessage && text === this.lastSentMessage.trim()) {
@@ -301,10 +320,17 @@ class GeminiProvider {
     const thinkingNodes = [
         ...findDeep(document, this.thinkingIndicatorSelector),
         ...findDeep(document, '.blue-circle'),
-        ...findDeep(document, '.typing-indicator')
+        ...findDeep(document, '.typing-indicator'),
+        ...findDeep(document, 'button[aria-label="Stop response"]')
     ];
                      
-    const isStillGenerating = thinkingNodes.some(node => node && node.offsetParent !== null);
+    const isStillGenerating = thinkingNodes.some(node => {
+        if (!node) return false;
+        // Check if visible
+        const style = window.getComputedStyle(node);
+        return style.display !== 'none' && style.visibility !== 'hidden' && node.offsetParent !== null;
+    });
+    
     console.log(`[${this.name}] isStillGenerating: ${isStillGenerating} (Found ${thinkingNodes.length} indicator nodes)`);
     
     const result = { 
@@ -316,6 +342,36 @@ class GeminiProvider {
 
     window.CHAT_RELAY_DEBUG = { lastResult: result, timestamp: new Date().toISOString() };
     return result;
+  }
+
+  // Helper to strip Gemini's UI-specific labels and boilerplate
+  _cleanResponse(text) {
+      if (!text) return "";
+      
+      let cleaned = text;
+
+      // 1. Remove "Conversation with Gemini" header
+      cleaned = cleaned.replace(/^Conversation with Gemini\s*/i, "");
+
+      // 2. If it's a sequence like "You said... Gemini said...", extract only what's after "Gemini said"
+      if (cleaned.includes("Gemini said")) {
+          const parts = cleaned.split(/Gemini said/i);
+          cleaned = parts[parts.length - 1].trim();
+      }
+
+      // 3. Remove footers/disclaimers
+      const footers = [
+          /Tools\s*Fast\s*/gi,
+          /Gemini is AI and can make mistakes\./gi,
+          /Check for accuracy\./gi,
+          /Google may use your conversations to improve its products/gi
+      ];
+
+      footers.forEach(regex => {
+          cleaned = cleaned.replace(regex, "");
+      });
+
+      return cleaned.trim();
   }
 
   getResponseText(element) {
