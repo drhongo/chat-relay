@@ -111,6 +111,7 @@ interface PendingRequest {
   resolve: (value: any) => void;
   reject: (reason?: any) => void;
   accumulatedResponse?: string;
+  streamChunk?: (chunk: string, isFinal: boolean) => void;
 }
 interface WebSocketMessage {
   type: string;
@@ -430,6 +431,30 @@ wss.on('connection', (ws: WebSocket) => {
               console.warn(`SERVER.TS: Failed to decode CHAT_RESPONSE for requestId: ${data.requestId}`);
             }
           }
+
+          // --- STREAMING SUPPORT ---
+          if (pendingRequest.streamChunk) {
+            const oldText = pendingRequest.accumulatedResponse || "";
+            const newText = responseText || "";
+            
+            let delta = "";
+            if (newText.startsWith(oldText)) {
+              // Cumulative update (common for DOM-based capture)
+              delta = newText.substring(oldText.length);
+            } else {
+              // Delta-based update or state reset
+              delta = newText;
+            }
+            
+            if (delta.length > 0 || data.isFinal) {
+              console.log(`SERVER.TS: Streaming chunk for ${data.requestId}. Delta length: ${delta.length}, isFinal: ${data.isFinal}`);
+              pendingRequest.streamChunk(delta, data.isFinal || false);
+            } else {
+              console.log(`SERVER.TS: Skipping empty chunk for ${data.requestId} (no delta).`);
+            }
+          }
+          // -------------------------
+
           // Buffer the response
           pendingRequest.accumulatedResponse = responseText;
           
@@ -444,7 +469,8 @@ wss.on('connection', (ws: WebSocket) => {
           console.warn(`SERVER.TS: Received CHAT_RESPONSE for unknown requestId: ${data.requestId}`);
           return;
         }
-      } else if (data.type === 'CHAT_RESPONSE_CHUNK' && data.isFinal === true) {
+      }
+ else if (data.type === 'CHAT_RESPONSE_CHUNK' && data.isFinal === true) {
         responseDataToUse = data.chunk;
       } else if (data.type === 'CHAT_RESPONSE_ERROR') {
         responseDataToUse = data.error || "Unknown error from extension";
@@ -570,6 +596,65 @@ async function processOrQueueRequest(queuedItem: QueuedRequest): Promise<void> {
   logAdminMessage('CHAT_REQUEST_PROCESSING', requestId, { status: 'Sending to extension', socketId: activeExtensionSocketId }).catch(err => console.error("ADMIN_LOG_ERROR:", err));
 
   try {
+    // --- START OF STREAMING LOGIC ---
+    if (req.body.stream) {
+      console.log(`SERVER.TS: Request ${requestId} - Starting SSE Stream.`);
+      res.setHeader('Content-Type', 'text/event-stream');
+      res.setHeader('Cache-Control', 'no-cache');
+      res.setHeader('Connection', 'keep-alive');
+      res.flushHeaders();
+
+      const responsePromise = new Promise<void>((resolve, reject) => {
+        const streamId = `chatcmpl-${Date.now()}`;
+        
+        pendingRequests.set(requestId, { 
+          resolve: () => {
+            res.write('data: [DONE]\n\n');
+            res.end();
+            resolve();
+          }, 
+          reject: (err) => {
+            console.error(`SERVER.TS: Stream error for ${requestId}:`, err);
+            // In SSE, we can't change the status code after headers are sent
+            res.write(`data: ${JSON.stringify({ error: { message: err.message } })}\n\n`);
+            res.end();
+            reject(err);
+          },
+          // This special callback handles chunks from the WebSocket
+          streamChunk: (chunk: string, isFinal: boolean) => {
+            const sseData = {
+              id: streamId,
+              object: "chat.completion.chunk",
+              created: Math.floor(Date.now() / 1000),
+              model: model || "relay-model",
+              choices: [{
+                index: 0,
+                delta: { content: chunk },
+                finish_reason: isFinal ? "stop" : null
+              }]
+            };
+            res.write(`data: ${JSON.stringify(sseData)}\n\n`);
+          }
+        });
+
+        setTimeout(() => {
+          if (pendingRequests.has(requestId)) {
+            const timedOutRequest = pendingRequests.get(requestId);
+            if (timedOutRequest) {
+              timedOutRequest.reject(new Error(`Stream request ${requestId} timed out`));
+            }
+            pendingRequests.delete(requestId);
+          }
+        }, currentRequestTimeoutMs);
+      });
+
+      const messageToExtension: WebSocketMessage = { type: 'SEND_CHAT_MESSAGE', requestId, message: userMessage, settings: { model, temperature, max_tokens, new_chat } };
+      extension.send(JSON.stringify(messageToExtension));
+      await responsePromise;
+      return;
+    }
+    // --- END OF STREAMING LOGIC ---
+
     const responsePromise = new Promise<string>((resolve, reject) => {
       pendingRequests.set(requestId, { resolve, reject });
       setTimeout(() => {
@@ -684,9 +769,9 @@ apiRouter.post('/chat/completions', async (req: Request, res: Response): Promise
     console.log(`SERVER.TS: Request ${requestId} identified as a FOLLOW-UP (effectiveNewChat=false).`);
   }
 
-  // Acknowledge stream, but don't implement it yet to keep the fix simple.
+  // Acknowledge stream
   if (stream) {
-    console.log(`SERVER.TS: Request ${requestId} requested streaming. The server will process this as a non-streaming request for now.`);
+    console.log(`SERVER.TS: Request ${requestId} requested streaming. Processing as SSE.`);
   }
 
   const queuedItem: QueuedRequest = { requestId, req, res, userMessage, model, temperature, max_tokens, new_chat: effectiveNewChat };
