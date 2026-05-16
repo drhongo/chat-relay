@@ -517,7 +517,10 @@ class ClaudeProvider {
   _captureResponseDOM(element = null) {
     if (!element) {
         const sentTrimmed = this.lastSentMessage.trim();
-        const userMsgEl = document.querySelector('[data-testid="user-message"]');
+        // Use the LAST user-message element so that in multi-turn conversations
+        // we walk siblings from the most recent user turn, not the first one.
+        const allUserMsgEls = document.querySelectorAll('[data-testid="user-message"]');
+        const userMsgEl = allUserMsgEls.length > 0 ? allUserMsgEls[allUserMsgEls.length - 1] : null;
 
         if (userMsgEl) {
             // Walk up from the user-message until we find an ancestor that has
