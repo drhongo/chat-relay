@@ -329,48 +329,49 @@ class ChatGptProvider {
             }
           }
           accumulator.currentProcessingStage = parseOutput.newProcessingStage; // Update stage
-          console.log(`[${this.name}] handleDebuggerData - requestId: ${requestId}, parseOutput: ${JSON.stringify(parseOutput)}`);
           
           if (parseOutput.text !== null || parseOutput.operation === "replace") { // Check for null explicitly if empty string is valid
               if (parseOutput.operation === "replace") {
-                  console.log(`[${this.name}] handleDebuggerData - Operation: replace. Old text for ${requestId}: "${accumulator.text.substring(0,50)}...". New text: "${parseOutput.text ? parseOutput.text.substring(0,50) : "null"}..."`);
                   accumulator.text = parseOutput.text;
               } else { // append
-                  console.log(`[${this.name}] handleDebuggerData - Operation: append. Current text for ${requestId}: "${accumulator.text.substring(0,50)}...". Appending: "${parseOutput.text ? parseOutput.text.substring(0,50) : "null"}..."`);
                   accumulator.text += parseOutput.text;
               }
           }
-          console.log(`[${this.name}] handleDebuggerData - Accumulator text for ${requestId} AFTER update: "${accumulator.text.substring(0,100)}..."`);
 
           if (parseOutput.isFinalResponse) {
               accumulator.isDefinitelyFinal = true;
-              console.log(`[${this.name}] handleDebuggerData - ${requestId} marked as definitelyFinal by parseOutput.`);
           }
           
-          // Invoke callback if there's new text, or if it's final, or if it was a replace operation (even with empty string)
-          if (parseOutput.text !== null || accumulator.isDefinitelyFinal || parseOutput.operation === "replace") {
-            // Safety: Don't send a FINAL empty response unless it's a definitive [DONE] or we've tried for a while.
-            // If it's final but text is empty, and we are NOT seeing the [DONE] marker, maybe wait.
-            if (accumulator.isDefinitelyFinal && accumulator.text.trim() === "" && !rawData.includes("[DONE]")) {
-                console.log(`[${this.name}] handleDebuggerData - Received 'final' signal but text is empty and no [DONE] marker. Keeping request alive.`);
-                accumulator.isDefinitelyFinal = false; // Reset finality to keep waiting
-                return;
-            }
+          // Invoke callback if there's new text
+          if (parseOutput.text !== null || parseOutput.operation === "replace") {
+            callback(requestId, accumulator.text, false); // Always non-final here, finality handled below
+          }
 
-            console.log(`[${this.name}] handleDebuggerData - INVOKING CALLBACK for ${requestId}. Text: "${accumulator.text.substring(0,100)}...", isFinal: ${accumulator.isDefinitelyFinal}, Stage: ${accumulator.currentProcessingStage}`);
-            callback(requestId, accumulator.text, accumulator.isDefinitelyFinal);
+          // If we flagged it as final, only report it if we actually have text
+          if (accumulator.isDefinitelyFinal) {
+              if (accumulator.text.trim().length > 0) {
+                  callback(requestId, accumulator.text, true);
+              } else {
+                  console.log(`[${this.name}] Debugger flagged final but text is empty. Falling back to DOM.`);
+                  accumulator.isDefinitelyFinal = false; 
+                  this._startDOMMonitoring(requestId);
+              }
           }
       }
     } else {
       if (isFinalFromBackground && !accumulator.isDefinitelyFinal) {
-          accumulator.isDefinitelyFinal = true;
-          console.log(`[${this.name}] handleDebuggerData - RawData empty, but isFinalFromBackground=true. INVOKING CALLBACK for ${requestId}. Text: "${accumulator.text.substring(0,100)}...", isFinal: true (forced)`);
-          callback(requestId, accumulator.text, accumulator.isDefinitelyFinal);
+          // If the network request is done but we have NO text, fall back to DOM immediately
+          if (accumulator.text.length === 0) {
+              console.log(`[${this.name}] handleDebuggerData - Network request finished with NO text. Starting DOM fallback.`);
+              this._startDOMMonitoring(requestId);
+          } else {
+              accumulator.isDefinitelyFinal = true;
+              callback(requestId, accumulator.text, true);
+          }
       }
     }
 
     if (accumulator.isDefinitelyFinal) {
-      console.log(`[${this.name}] handleDebuggerData - CLEANING UP for ${requestId} as accumulator.isDefinitelyFinal is true.`);
       this.pendingResponseCallbacks.delete(requestId);
       this.requestAccumulators.delete(requestId);
     }
@@ -378,10 +379,7 @@ class ChatGptProvider {
 
   handleWebSocketData(requestId, rawData) {
     const callback = this.pendingResponseCallbacks.get(requestId);
-    if (!callback) {
-      console.warn(`[${this.name}] handleWebSocketData - No callback for requestId: ${requestId}.`);
-      return;
-    }
+    if (!callback) return;
 
     let accumulator = this.requestAccumulators.get(requestId);
     if (!accumulator) {
@@ -389,9 +387,7 @@ class ChatGptProvider {
       this.requestAccumulators.set(requestId, accumulator);
     }
 
-    if (accumulator.isDefinitelyFinal) {
-      return;
-    }
+    if (accumulator.isDefinitelyFinal) return;
 
     const parseOutput = this.parseDebuggerResponse(rawData, accumulator.currentProcessingStage);
     accumulator.currentProcessingStage = parseOutput.newProcessingStage;
@@ -689,9 +685,12 @@ class ChatGptProvider {
         } catch (e) {
             // Check if it's likely JavaScript or other non-SSE content
             const trimmedLine = line.trim();
-            if (trimmedLine.startsWith('import ') ||
-                trimmedLine.startsWith('export ') ||
+            if (trimmedLine.startsWith('import') || 
+                trimmedLine.startsWith('export') || 
                 trimmedLine.startsWith('function(') ||
+                trimmedLine.startsWith('const ') ||
+                trimmedLine.startsWith('let ') ||
+                trimmedLine.startsWith('//#') || // Catch source mapping URLs
                 trimmedLine.includes('react.memo_cache_sentinel') ||
                 trimmedLine.length > 500) { // Likely minified JS or large binary chunk
                 // Silently skip likely non-SSE content
@@ -746,6 +745,9 @@ class ChatGptProvider {
 
     let responseText = element.innerText || element.textContent || "";
 
+    // CLEANUP: Strip ChatGPT UI noise
+    responseText = this._cleanResponse(responseText);
+
     // Log for debugging mismatch
     if (responseText.length > 0) {
         console.log(`[${this.name}] DOM capture found text length: ${responseText.length}. Sample: "${responseText.substring(0, 30)}..."`);
@@ -765,6 +767,26 @@ class ChatGptProvider {
         };
     }
     return { text: null, isStillGenerating: isStillGenerating };
+  }
+
+  // Helper to strip ChatGPT's UI-specific labels and boilerplate
+  _cleanResponse(text) {
+      if (!text) return "";
+      
+      let cleaned = text;
+
+      // 1. Remove footers/disclaimers
+      const footers = [
+          /ChatGPT can make mistakes\. Check important info\./gi,
+          /ChatGPT can make mistakes\. Consider checking important information\./gi,
+          /ChatGPT\s*v[\d.]+\s*/gi
+      ];
+
+      footers.forEach(regex => {
+          cleaned = cleaned.replace(regex, "");
+      });
+
+      return cleaned.trim();
   }
 
   _isResponseStillGeneratingDOM() {
@@ -788,53 +810,58 @@ class ChatGptProvider {
     return false; 
   }
 
-  _startDOMMonitoring(requestId) {
-    console.log(`[${this.name}] Starting DOM monitoring for requestId: ${requestId}. Interval: 500ms.`);
+  async _startDOMMonitoring(requestId) {
+    console.log(`[${this.name}] Starting DOM monitoring for requestId: ${requestId}.`);
+    this._stopDOMMonitoring();
+
     let lastCapturedText = "";
-    let lastCheckTime = Date.now();
     let noChangeStreak = 0;
+    let checkCount = 0;
+    
+    // Warm-up delay
+    await new Promise(resolve => setTimeout(resolve, 1500));
+
     const monitor = () => {
         const callback = this.pendingResponseCallbacks.get(requestId);
         if (!callback) {
-            console.log(`[${this.name}] DOM monitor: Callback for ${requestId} no longer exists. Stopping.`);
             this._stopDOMMonitoring();
             return;
         }
-        const captureResult = this._captureResponseDOM();
-        const currentText = captureResult.text;
-        const isStillGenerating = captureResult.isStillGenerating;
+
+        checkCount++;
+        
+        const result = this._captureResponseDOM();
+        const currentText = result.text;
+        const isGenerating = result.isStillGenerating;
         let isFinalDOMResponse = false;
+        
         if (currentText && currentText !== lastCapturedText) {
-            console.log(`[${this.name}] DOM monitor (ReqID: ${requestId}): New content detected. Length: ${currentText.length}. Last length: ${lastCapturedText.length}. Still generating: ${isStillGenerating}`);
             lastCapturedText = currentText;
-            noChangeStreak = 0; 
-            callback(requestId, currentText, false); 
-        } else if (currentText && currentText === lastCapturedText) {
-            noChangeStreak++;
-        } else if (!currentText) {
+            noChangeStreak = 0;
+            callback(requestId, currentText, false);
+        } else if (currentText === lastCapturedText) {
             noChangeStreak++;
         }
-        const STABILITY_CHECKS = 4; 
-        if (!isStillGenerating && noChangeStreak >= STABILITY_CHECKS && lastCapturedText.trim() !== "") {
-            console.log(`[${this.name}] DOM monitor (ReqID: ${requestId}): Response appears stable and complete. No generating indicator, and ${noChangeStreak} unchanged checks.`);
+
+        // Stability check: require longer streak for short text
+        const requiredStreak = lastCapturedText.length < 50 ? 10 : 5;
+        if (!isGenerating && noChangeStreak >= requiredStreak && lastCapturedText.trim() !== "") {
             isFinalDOMResponse = true;
         }
-        const MAX_WAIT_AFTER_NO_GENERATING = 5000; 
-        if (!isStillGenerating && lastCapturedText.trim() !== "" && (Date.now() - lastCheckTime > MAX_WAIT_AFTER_NO_GENERATING) && noChangeStreak > 0) {
-            console.log(`[${this.name}] DOM monitor (ReqID: ${requestId}): Max wait time reached after no 'generating' signal. Assuming final.`);
-            isFinalDOMResponse = true;
-        }
+
+        // Safety timeout
+        if (checkCount > 120) isFinalDOMResponse = true;
+
         if (isFinalDOMResponse) {
-            console.log(`[${this.name}] DOM monitor (ReqID: ${requestId}): Sending final response. Text length: ${lastCapturedText.length}`);
+            console.log(`[${this.name}] DOM monitoring finished for ${requestId}. Final length: ${lastCapturedText.length}`);
             callback(requestId, lastCapturedText, true);
             this.pendingResponseCallbacks.delete(requestId);
             this._stopDOMMonitoring();
         } else {
-            lastCheckTime = Date.now(); 
-            this.domMonitorTimer = setTimeout(monitor, 500); 
+            this.domMonitorTimer = setTimeout(monitor, 500);
         }
     };
-    this.domMonitorTimer = setTimeout(monitor, 100); 
+    monitor();
   }
 
   _stopDOMMonitoring() {
