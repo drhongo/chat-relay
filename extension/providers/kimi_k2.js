@@ -169,14 +169,28 @@ class KimiK2Provider {
         }
 
         if (!insertSucceeded) {
-          if (inputField.tagName.toLowerCase() === 'div' && inputField.contentEditable === 'true') {
+          if (inputField.tagName.toLowerCase() === 'div' && inputField.isContentEditable) {
             inputField.innerHTML = '';
             inputField.textContent = textToInput;
           } else {
-            inputField.value = textToInput;
+            // Safe React value setter fallback
+            try {
+              const nativeSetter = Object.getOwnPropertyDescriptor(
+                window.HTMLTextAreaElement.prototype,
+                'value'
+              ).set;
+              nativeSetter.call(inputField, textToInput);
+            } catch (e) {
+              inputField.value = textToInput;
+            }
           }
-          inputField.dispatchEvent(new Event('input', { bubbles: true }));
         }
+
+        // Trigger multiple events to satisfy React/Next.js/Vue state updates
+        const events = ['input', 'change', 'keyup', 'keydown'];
+        events.forEach(type => {
+          inputField.dispatchEvent(new Event(type, { bubbles: true, cancelable: true }));
+        });
       }
 
       await new Promise(resolve => setTimeout(resolve, 300));
@@ -191,11 +205,31 @@ class KimiK2Provider {
 
       const sendButton = sendButtons[0];
       const isButtonDisabled = sendButton.disabled || sendButton.getAttribute('aria-disabled') === 'true' || sendButton.classList.contains('disabled');
-      if (isButtonDisabled) {
-        console.warn(`[${this.name}] Send button is disabled, clicking anyway.`);
+      
+      if (!isButtonDisabled) {
+        // Human-like click events sequence
+        const rect = sendButton.getBoundingClientRect();
+        const clientX = rect.left + rect.width / 2;
+        const clientY = rect.top + rect.height / 2;
+
+        sendButton.dispatchEvent(new PointerEvent('pointerdown', { bubbles: true, cancelable: true, pointerType: 'mouse', clientX, clientY }));
+        sendButton.dispatchEvent(new MouseEvent('mousedown', { bubbles: true, cancelable: true, clientX, clientY }));
+        sendButton.focus();
+        sendButton.dispatchEvent(new PointerEvent('pointerup', { bubbles: true, cancelable: true, pointerType: 'mouse', clientX, clientY }));
+        sendButton.dispatchEvent(new MouseEvent('mouseup', { bubbles: true, cancelable: true, clientX, clientY }));
+        sendButton.click();
+
+        // Enter key fallback sequence
+        setTimeout(() => {
+          inputField.dispatchEvent(new KeyboardEvent('keydown', { key: 'Enter', code: 'Enter', keyCode: 13, which: 13, bubbles: true, cancelable: true }));
+          inputField.dispatchEvent(new KeyboardEvent('keypress', { key: 'Enter', code: 'Enter', keyCode: 13, which: 13, bubbles: true, cancelable: true }));
+        }, 100);
+      } else {
+        console.warn(`[${this.name}] Send button is disabled. Sending Enter keyboard event.`);
+        inputField.dispatchEvent(new KeyboardEvent('keydown', { key: 'Enter', code: 'Enter', keyCode: 13, which: 13, bubbles: true, cancelable: true }));
+        inputField.dispatchEvent(new KeyboardEvent('keypress', { key: 'Enter', code: 'Enter', keyCode: 13, which: 13, bubbles: true, cancelable: true }));
       }
 
-      sendButton.click();
       return true;
     } catch (error) {
       console.error(`[${this.name}] Error sending chat message:`, error);
@@ -284,6 +318,7 @@ class KimiK2Provider {
           callback(requestId, "[Empty response captured]", true);
         }
         this.pendingResponseCallbacks.delete(requestId);
+        this.requestAccumulators.delete(requestId);
         this._stopDOMMonitoring();
       } else {
         this.domMonitorTimer = setTimeout(monitor, 250);
@@ -301,11 +336,11 @@ class KimiK2Provider {
   }
 
   _isGenerating() {
-    // Secondary check: look for typing indicator
+    // Check loading indicator or typing animations
     const thinkingIndicators = document.querySelectorAll(this.thinkingIndicatorSelector);
     if (thinkingIndicators.length > 0) return true;
 
-    // Check if send button is disabled (often means generating)
+    // Check if send button is disabled
     const sendButtons = document.querySelectorAll(this.sendButtonSelector);
     if (sendButtons.length > 0) {
       const sendButton = sendButtons[0];
@@ -455,21 +490,67 @@ class KimiK2Provider {
     if (!cb) return;
 
     const parsed = this.parseDebuggerResponse(rawData);
-    if (parsed.text || isFinal) {
-      cb(requestId, parsed.text, isFinal);
+    
+    // Memory-safe, robust accumulation of streaming debugger chunks
+    const existing = this.requestAccumulators.get(requestId) || '';
+    const updated = existing + parsed.text;
+    this.requestAccumulators.set(requestId, updated);
+
+    const finalFlag = isFinal || parsed.isFinalResponse;
+    if (updated || finalFlag) {
+      cb(requestId, updated, finalFlag);
     }
-    if (isFinal) {
+
+    if (finalFlag) {
       this.pendingResponseCallbacks.delete(requestId);
+      this.requestAccumulators.delete(requestId);
     }
   }
 
   parseDebuggerResponse(raw) {
-    if (!raw) return { text: '', isFinalResponse: false };
-    if (raw.includes('[DONE]')) {
-      const clean = raw.replace('[DONE]', '').trim();
-      return { text: clean, isFinalResponse: true };
+    if (!raw) {
+      return { text: '', isFinalResponse: false };
     }
-    return { text: raw.trim(), isFinalResponse: false };
+
+    // Convert potential JSON/object stream data to text safely to avoid includes() TypeError crashes
+    const textRaw = typeof raw === 'string' ? raw : JSON.stringify(raw);
+    const lines = textRaw.split('\n');
+
+    let output = '';
+    let final = false;
+
+    // Robust SSE streaming protocol parser
+    for (const line of lines) {
+      const trimmed = line.trim();
+
+      if (!trimmed.startsWith('data:')) {
+        continue;
+      }
+
+      const payload = trimmed.replace(/^data:\s*/, '');
+
+      if (payload === '[DONE]') {
+        final = true;
+        continue;
+      }
+
+      try {
+        const json = JSON.parse(payload);
+        const token =
+          json.choices?.[0]?.delta?.content ||
+          json.text ||
+          '';
+
+        output += token;
+      } catch {
+        output += payload;
+      }
+    }
+
+    return {
+      text: output,
+      isFinalResponse: final
+    };
   }
 
   getStreamingApiPatterns() {
