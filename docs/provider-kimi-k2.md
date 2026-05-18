@@ -6,7 +6,7 @@ This document describes the `KimiK2Provider` used by the extension to automate t
 
 ## 🧩 Overview
 
-`KimiK2Provider` is modeled after the existing AI Studio and ChatGPT providers. It sends messages and captures responses from `k2.kimi.ai` using DOM based monitoring by default with an optional debugger fallback.
+`KimiK2Provider` is modeled after the existing AI Studio and ChatGPT providers. It sends messages and captures responses from `kimi.com` using DOM based monitoring by default with an optional debugger fallback.
 
 ---
 
@@ -14,7 +14,7 @@ This document describes the `KimiK2Provider` used by the extension to automate t
 
 ```js
 this.captureMethod = 'dom'; // or 'debugger'
-this.debuggerUrlPattern = '*k2.kimi.ai/api/chat*';
+this.debuggerUrlPattern = '*kimi.com/api/chat*';
 this.includeThinkingInMessage = false;
 ```
 

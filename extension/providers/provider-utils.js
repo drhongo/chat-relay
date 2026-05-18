@@ -17,6 +17,7 @@
  */
 // AI Chat Relay - Provider Utilities
 
+{
 // Map of supported domains to provider instances
 const providerMap = {}; // Stores { domain: { name: providerName, instance: providerObject } }
 
@@ -80,3 +81,4 @@ window.providerUtils = {
     return detectProvider(hostname);
   }
 };
+}

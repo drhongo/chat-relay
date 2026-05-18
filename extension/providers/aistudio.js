@@ -184,9 +184,9 @@ class AIStudioProvider {
     // Handle New Chat request
     if (typeof messageOrId === 'object' && messageOrId.settings && messageOrId.settings.new_chat) {
         console.log(`[${this.name}] New Chat requested. Clicking New Chat button.`);
-        const newChatButton = document.querySelector('a[href="/prompts/new"], button[aria-label="New prompt"]');
-        if (newChatButton) {
-            newChatButton.click();
+        const newChatButtons = this._findDeep(document, 'a[href="/prompts/new"], button[aria-label="New prompt"]');
+        if (newChatButtons.length > 0) {
+            newChatButtons[0].click();
             await new Promise(resolve => setTimeout(resolve, 2000));
         }
     }

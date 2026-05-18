@@ -17,6 +17,7 @@
  */
 // AI Chat Relay - Content Script
 
+{
 // Prefix for console logs
 const CS_LOG_PREFIX = '[CS CONTENT]';
 console.log(CS_LOG_PREFIX, "Content Script Injected & Loaded");
@@ -973,5 +974,6 @@ function attemptInitialization() {
         console.error(CS_LOG_PREFIX, "Error during initialization:", error);
         console.error(CS_LOG_PREFIX, "Error stack:", error.stack);
     }
+}
 }
 

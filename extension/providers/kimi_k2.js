@@ -15,22 +15,21 @@
  * You should have received a copy of the GNU Affero General Public License
  * along with this program.  If not, see https://www.gnu.org/licenses/.
  */
-// AI Chat Relay - Kimi K2 Provider
-
+{
 class KimiK2Provider {
   constructor() {
     this.name = 'KimiK2Provider';
-    this.supportedDomains = ['k2.kimi.ai'];
+    this.supportedDomains = ['kimi.com'];
 
     // --- START OF CONFIGURABLE PROPERTIES ---
     this.captureMethod = 'dom'; // DOM capture by default
-    this.debuggerUrlPattern = '*k2.kimi.ai/api/chat*';
+    this.debuggerUrlPattern = '*kimi.com/api/chat*';
     this.includeThinkingInMessage = false;
     // --- END OF CONFIGURABLE PROPERTIES ---
 
     this.inputSelector = 'textarea, div[contenteditable="true"], [role="textbox"]';
-    this.sendButtonSelector = 'button[type="submit"], button.send-btn, button[class*="send"], button:has(svg)';
-    this.responseSelector = '.message.ai, .chat-message.ai, .ai-message, [data-testid="assistant-message"]';
+    this.sendButtonSelector = '.send-button-container, .send-icon, svg[name="Send"], button[type="submit"], button.send-btn, button[class*="send"], button:has(svg)';
+    this.responseSelector = '.segment.segment-assistant, .segment-assistant, .segment:not(.segment-user), .message.ai, .chat-message.ai, .ai-message, [data-testid="assistant-message"], .chat-item-container[data-role="assistant"], div[class*="assistant-message"]';
     this.thinkingIndicatorSelector = '.typing, .loading, [class*="typing"], [class*="loading"], .thinking-indicator';
     this.newChatSelector = 'button.new-chat, a[href="/"], button:has(svg[class*="new-chat"])';
 
@@ -95,10 +94,12 @@ class KimiK2Provider {
         console.log(`[${this.name}] Found New Chat button, clicking...`);
         newChatButtons[0].click();
         await new Promise(resolve => setTimeout(resolve, 3000));
-      } else {
-        console.log(`[${this.name}] New Chat button not found, navigating home...`);
-        window.location.href = "https://k2.kimi.ai/";
+      } else if (window.location.pathname !== "/" && window.location.pathname !== "") {
+        console.log(`[${this.name}] New Chat button not found, and not on homepage. Navigating home...`);
+        window.location.href = "https://kimi.com/";
         await new Promise(resolve => setTimeout(resolve, 4000));
+      } else {
+        console.log(`[${this.name}] Already on Kimi homepage and no button found. Skipping navigation.`);
       }
     }
 
@@ -198,7 +199,13 @@ class KimiK2Provider {
       // Click Send Button
       const sendButtons = this._findDeep(document, this.sendButtonSelector);
       if (sendButtons.length === 0) {
-        console.error(`[${this.name}] Missing send button.`);
+        const allButtons = this._findDeep(document, 'button, [role="button"], a, [class*="send"], svg');
+        console.log(`[${this.name}] Diagnosing send button: Found ${allButtons.length} total potential clickable elements.`);
+        allButtons.forEach((btn, idx) => {
+          if (idx < 50) {
+            console.log(`[${this.name}] clickable #${idx}: tagName=${btn.tagName}, class=${btn.className}, id=${btn.id}, text=${(btn.innerText || btn.textContent || "").substring(0, 30).trim()}, aria-label=${btn.getAttribute('aria-label')}, parentClass=${btn.parentElement ? btn.parentElement.className : ''}`);
+          }
+        });
         this._reportSendError(requestId, "Send button not found.");
         return false;
       }
@@ -408,7 +415,7 @@ class KimiK2Provider {
                 }
             }
 
-            const copyButtons = this._findDeep(container, 'button:has(svg[class*="copy"]), button.copy-btn, [class*="copy"] button, button[aria-label*="Copy" i], button[title*="Copy" i]');
+            const copyButtons = this._findDeep(container, '.icon-button:has(svg[name="Copy"]), svg[name="Copy"], [name="Copy"], button:has(svg[class*="copy"]), button.copy-btn, [class*="copy"] button, button[aria-label*="Copy" i], button[title*="Copy" i]');
             if (copyButtons.length > 0) {
                 const lastBtn = copyButtons[copyButtons.length - 1];
                 lastBtn.click();
@@ -577,3 +584,4 @@ class KimiK2Provider {
     setTimeout(register, 500);
   }
 })();
+}

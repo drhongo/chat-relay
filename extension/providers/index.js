@@ -41,7 +41,7 @@ function detectProvider(url) {
     return providers.chatgpt;
   } else if (url.includes('claude.ai')) {
     return providers.claude;
-  } else if (url.includes('k2.kimi.ai')) {
+  } else if (url.includes('kimi.com')) {
     return providers.kimi_k2;
   }
   

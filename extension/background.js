@@ -36,7 +36,7 @@ let lastSuccessfullyProcessedMessageText = null;
 const pendingRequestDetails = new Map(); 
 
 // Supported domains for chat interfaces
-const supportedDomains = ['gemini.google.com', 'aistudio.google.com', 'chatgpt.com', 'claude.ai', 'k2.kimi.ai'];
+const supportedDomains = ['gemini.google.com', 'aistudio.google.com', 'chatgpt.com', 'claude.ai', 'kimi.com'];
 
 // ===== DEBUGGER RELATED GLOBALS =====
 const BG_LOG_PREFIX = '[BG DEBUGGER]';
@@ -53,22 +53,44 @@ chrome.alarms.onAlarm.addListener((alarm) => {
   }
 });
 
+const originalLog = console.log;
+const originalWarn = console.warn;
+const originalError = console.error;
+
 /**
  * Sends a log message to the relay server for remote debugging.
  */
 function sendRemoteLog(level, message, requestId = null) {
     if (relaySocket && relaySocket.readyState === WebSocket.OPEN) {
-        relaySocket.send(JSON.stringify({
-            type: 'LOG_MESSAGE',
-            level: level,
-            message: `[BACKGROUND] ${message}`,
-            requestId: requestId
-        }));
+        try {
+            relaySocket.send(JSON.stringify({
+                type: 'LOG_MESSAGE',
+                level: level,
+                message: `[BACKGROUND] ${message}`,
+                requestId: requestId
+            }));
+        } catch (e) {
+            // Ignore socket send errors
+        }
     }
-    if (level === 'error') console.error(message);
-    else if (level === 'warn') console.warn(message);
-    else console.log(message);
+    if (level === 'error') originalError(message);
+    else if (level === 'warn') originalWarn(message);
+    else originalLog(message);
 }
+
+// Monkey-patch console methods to send to relay server
+console.log = (...args) => {
+    const msg = args.map(arg => typeof arg === 'object' ? JSON.stringify(arg) : String(arg)).join(' ');
+    sendRemoteLog('info', msg);
+};
+console.warn = (...args) => {
+    const msg = args.map(arg => typeof arg === 'object' ? JSON.stringify(arg) : String(arg)).join(' ');
+    sendRemoteLog('warn', msg);
+};
+console.error = (...args) => {
+    const msg = args.map(arg => typeof arg === 'object' ? JSON.stringify(arg) : String(arg)).join(' ');
+    sendRemoteLog('error', msg);
+};
 
 
 // Load settings and connect to the relay server
@@ -192,19 +214,21 @@ async function forwardCommandToContentScript(command) {
             if (chrome.runtime.lastError) {
               const lastErr = chrome.runtime.lastError.message;
               console.warn(`[BG RELAY] Error sending to tab ${targetTabIdForCommand}: ${lastErr}`);
-              if (lastErr.includes("Receiving end does not exist") || lastErr.includes("context invalidated") || lastErr.includes("No tab with given id")) {
+               if (lastErr.includes("Receiving end does not exist") || lastErr.includes("context invalidated") || lastErr.includes("No tab with given id") || lastErr.includes("message channel closed")) {
                 if (lastErr.includes("No tab with given id")) {
                   console.log(`[BG RELAY] Tab ${targetTabIdForCommand} is gone. Stopping retries.`);
                   processingRequest = false;
                   processNextRequest();
                   return;
                 }
-                console.warn(`[BG RELAY] Context invalidated for tab ${targetTabIdForCommand}. Attempting re-injection...`);
+                console.warn(`[BG RELAY] Context invalidated or channel closed for tab ${targetTabIdForCommand}. Attempting re-injection...`);
                 try {
                   const tab = await chrome.tabs.get(targetTabIdForCommand);
                   const providerFile = isUrlSupportedByProvider(tab.url, "ChatGptProvider") ? "providers/chatgpt.js" :
                                       isUrlSupportedByProvider(tab.url, "GeminiProvider") ? "providers/gemini.js" :
-                                      isUrlSupportedByProvider(tab.url, "ClaudeProvider") ? "providers/claude.js" : null;
+                                      isUrlSupportedByProvider(tab.url, "ClaudeProvider") ? "providers/claude.js" :
+                                      isUrlSupportedByProvider(tab.url, "AIStudioProvider") ? "providers/aistudio.js" :
+                                      isUrlSupportedByProvider(tab.url, "KimiK2Provider") ? "providers/kimi_k2.js" : null;
 
                   if (providerFile) {
                     await chrome.scripting.executeScript({
@@ -239,13 +263,15 @@ async function findAndSendToSuitableTab(command, justFinding = false) {
     const modelLower = (command.model || "").toLowerCase();
     const providerType = modelLower.includes('gpt') ? 'chatgpt' :
                          modelLower.includes('gemini') ? 'gemini' :
-                         modelLower.includes('claude') ? 'claude' : null;
+                         modelLower.includes('claude') ? 'claude' :
+                         modelLower.includes('kimi') ? 'kimi' : null;
 
     const matchingTabs = tabs.filter(tab => {
       if (!tab.url) return false;
       if (providerType === 'chatgpt') return tab.url.includes('chatgpt.com') || tab.url.includes('openai.com');
       if (providerType === 'gemini') return tab.url.includes('gemini.google.com') || tab.url.includes('aistudio.google.com');
       if (providerType === 'claude') return tab.url.includes('claude.ai');
+      if (providerType === 'kimi') return tab.url.includes('kimi.com');
       return supportedDomains.some(domain => tab.url.includes(domain));
     });
     
@@ -293,6 +319,7 @@ function isUrlSupportedByProvider(url, providerName) {
     if (providerName === "GeminiProvider") return lowerUrl.includes("gemini.google.com");
     if (providerName === "ChatGptProvider") return lowerUrl.includes("chatgpt.com");
     if (providerName === "ClaudeProvider") return lowerUrl.includes("claude.ai");
+    if (providerName === "KimiK2Provider") return lowerUrl.includes("kimi.com");
     return false;
 }
 

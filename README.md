@@ -93,7 +93,7 @@ Interacts with Gemini, AI Studio, ChatGPT, and Claude UIs. Injects chat, capture
 - AI Studio (`aistudio.google.com`)
 - ChatGPT (`chatgpt.com`)
 - Claude (`claude.ai`)
-- Kimi K2 (`k2.kimi.ai`)
+- Kimi (`kimi.com`)
 
 ChatGPT is a trademark of OpenAI. Gemini and AI Studio are trademarks of Google. Claude is a trademark of Anthropic. This project is not affiliated with, endorsed by, or sponsored by OpenAI, Google, or Anthropic.
 

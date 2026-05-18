@@ -19,7 +19,8 @@
     "*://*.chatgpt.com/*",
     "*://*.aistudio.com/*",
     "*://*.claude.ai/*",
-    "*://*.k2.kimi.ai/*",
+    "*://*.kimi.com/*",
+    "*://kimi.com/*",
     "ws://localhost:*/"
   ],
   "background": {
@@ -63,7 +64,7 @@
       "run_at": "document_idle"
     },
     {
-      "matches": ["*://k2.kimi.ai/*"],
+      "matches": ["*://*.kimi.com/*", "*://kimi.com/*"],
       "js": [
         "providers/provider-utils.js",
         "providers/kimi_k2.js",
@@ -89,7 +90,9 @@
         "*://*.claude.ai/*",
         "*://claude.ai/*",
         "*://*.google.com/*",
-        "*://google.com/*"
+        "*://google.com/*",
+        "*://*.kimi.com/*",
+        "*://kimi.com/*"
       ]
     }
   ]
