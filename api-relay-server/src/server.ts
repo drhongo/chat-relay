@@ -441,9 +441,13 @@ wss.on('connection', (ws: WebSocket) => {
             if (newText.startsWith(oldText)) {
               // Cumulative update (common for DOM-based capture)
               delta = newText.substring(oldText.length);
+            } else if (newText.length > oldText.length) {
+              // UI Reset or slight mismatch: Only send what is PAST the previous length
+              // to avoid duplicating the entire message in the client UI.
+              delta = newText.substring(oldText.length);
             } else {
-              // Delta-based update or state reset
-              delta = newText;
+              // Shorter or equal text: Likely a stale update or a hard reset we can't safely stream
+              delta = "";
             }
             
             if (delta.length > 0 || data.isFinal) {

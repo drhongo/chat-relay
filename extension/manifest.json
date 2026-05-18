@@ -8,7 +8,9 @@
     "storage",
     "alarms",
     "debugger",
-    "tabs"
+    "tabs",
+    "clipboardRead",
+    "clipboardWrite"
   ],
   "optional_permissions": [
   ],
@@ -77,5 +79,18 @@
   "options_ui": {
     "page": "options.html",
     "open_in_tab": true
-  }
+  },
+  "web_accessible_resources": [
+    {
+      "resources": ["providers/proxy.js"],
+      "matches": [
+        "*://*.chatgpt.com/*",
+        "*://chatgpt.com/*",
+        "*://*.claude.ai/*",
+        "*://claude.ai/*",
+        "*://*.google.com/*",
+        "*://google.com/*"
+      ]
+    }
+  ]
 }

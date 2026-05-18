@@ -301,6 +301,18 @@ chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
   const type = message.type || message.action;
   
   if (type === "CONTENT_SCRIPT_LOADED") {
+    if (sender.tab && sender.tab.id) {
+      console.log(`[BACKGROUND] Injecting proxy.js in MAIN world for tab ${sender.tab.id}`);
+      chrome.scripting.executeScript({
+        target: { tabId: sender.tab.id },
+        files: ['providers/proxy.js'],
+        world: 'MAIN'
+      }).then(() => {
+        sendRemoteLog('info', `Successfully injected proxy.js in MAIN world for tab ${sender.tab.id}`);
+      }).catch(err => {
+        sendRemoteLog('error', `Failed to inject proxy.js in MAIN world for tab ${sender.tab.id}: ${err.message}`);
+      });
+    }
     sendResponse({ success: true });
     return true;
   }

@@ -31,7 +31,7 @@ class GeminiProvider {
     // Selectors for the Gemini interface
     this.inputSelector = 'div.ql-editor, div[contenteditable="true"], textarea[placeholder="Enter a prompt here"], textarea.message-input';
     this.sendButtonSelector = 'button[aria-label="Send message"], .send-button-container button, .input-area-container button[kind="filled"]';
-    this.responseSelector = 'div.markdown.markdown-main-panel, message-content div.markdown, [id^="model-response-message-content"], .model-response-text .markdown';
+    this.responseSelector = 'div.markdown.markdown-main-panel, message-content div.markdown, message-content .markdown-renderer, [id^="model-response-message-content"], .model-response-text .markdown';
     this.thinkingIndicatorSelector = '.thinking-indicator, .loading-indicator, .typing-indicator, .response-loading, .blue-circle, .stop-icon, button[aria-label="Stop response"]';
     this.newChatSelector = 'a[href="/app"], .new-chat-button, [data-testid="sidebar-new-chat-button"], button[aria-label="New chat"]';
 
@@ -42,8 +42,26 @@ class GeminiProvider {
     this.domFallbackTimer = null;
     this.domMonitorTimer = null;
 
+    this._lastInterceptedClipboardText = null;
+    this._injectClipboardProxy();
     this._loadSettings();
     console.log(`[${this.name}] Provider initialized.`);
+  }
+
+  _injectClipboardProxy() {
+      this._lastDOMText = null;
+      this._lastDOMIsGenerating = false;
+
+      window.addEventListener('message', (e) => {
+          if (!e.data) return;
+          if (e.data.type === 'RELAY_CLIPBOARD_CAPTURE') {
+              this._lastInterceptedClipboardText = e.data.detail;
+              console.log(`[${this.name}] Received intercepted text from proxy.`);
+          } else if (e.data.type === 'RELAY_DOM_UPDATE') {
+              this._lastDOMText = e.data.text;
+              this._lastDOMIsGenerating = e.data.isGenerating;
+          }
+      });
   }
 
   _loadSettings() {
@@ -65,30 +83,69 @@ class GeminiProvider {
     } else if (Array.isArray(messageContent)) {
       textToInput = messageContent.map(p => p.text || "").join("\n");
     }
-    
+
     try {
       this.lastSentMessage = textToInput;
+      this._lastDOMText = null;
+      this._lastDOMIsGenerating = true;
+
+      let expectedIndex = 0;
+      const isNewChat = typeof messageOrId === 'object' && messageOrId.settings && messageOrId.settings.new_chat;
+      if (!isNewChat) {
+          const findDeep = (root, selector) => {
+              const results = [];
+              const search = (node) => {
+                  if (!node) return;
+                  if (node.matches && node.matches(selector)) {
+                      results.push(node);
+                  }
+                  if (node.querySelectorAll) {
+                      const direct = node.querySelectorAll(selector);
+                      for (const el of direct) {
+                          if (!results.includes(el)) {
+                              results.push(el);
+                          }
+                      }
+                  }
+                  if (node.shadowRoot) {
+                      search(node.shadowRoot);
+                  }
+                  let child = node.firstElementChild;
+                  while (child) {
+                      search(child);
+                      child = child.nextElementSibling;
+                  }
+              };
+              search(root);
+              return results;
+          };
+          const existingHosts = findDeep(document, 'model-response message-content');
+          expectedIndex = existingHosts.length;
+      }
+      this._currentExpectedIndex = expectedIndex;
+      console.log(`[${this.name}] Setting expected response index to ${expectedIndex}`);
+      window.postMessage({ type: 'RELAY_SET_EXPECTED_INDEX', index: expectedIndex }, '*');
 
       // Handle New Chat request
       if (typeof messageOrId === 'object' && messageOrId.settings && messageOrId.settings.new_chat) {
-          // Robust check for New Chat - if we are not on the main /app page, or even if we are (to clear draft)
-          console.log(`[${this.name}] New Chat requested. Clicking New Chat button.`);
-          const newChatButton = document.querySelector(this.newChatSelector);
-          if (newChatButton) {
-              const rect = newChatButton.getBoundingClientRect();
-              const clientX = rect.left + rect.width / 2;
-              const clientY = rect.top + rect.height / 2;
+        // Robust check for New Chat - if we are not on the main /app page, or even if we are (to clear draft)
+        console.log(`[${this.name}] New Chat requested. Clicking New Chat button.`);
+        const newChatButton = document.querySelector(this.newChatSelector);
+        if (newChatButton) {
+          const rect = newChatButton.getBoundingClientRect();
+          const clientX = rect.left + rect.width / 2;
+          const clientY = rect.top + rect.height / 2;
 
-              newChatButton.dispatchEvent(new PointerEvent('pointerdown', { bubbles: true, pointerType: 'mouse', clientX, clientY }));
-              newChatButton.dispatchEvent(new MouseEvent('mousedown', { bubbles: true, clientX, clientY }));
-              newChatButton.click();
-              newChatButton.dispatchEvent(new PointerEvent('pointerup', { bubbles: true, pointerType: 'mouse', clientX, clientY }));
-              newChatButton.dispatchEvent(new MouseEvent('mouseup', { bubbles: true, clientX, clientY }));
+          newChatButton.dispatchEvent(new PointerEvent('pointerdown', { bubbles: true, pointerType: 'mouse', clientX, clientY }));
+          newChatButton.dispatchEvent(new MouseEvent('mousedown', { bubbles: true, clientX, clientY }));
+          newChatButton.click();
+          newChatButton.dispatchEvent(new PointerEvent('pointerup', { bubbles: true, pointerType: 'mouse', clientX, clientY }));
+          newChatButton.dispatchEvent(new MouseEvent('mouseup', { bubbles: true, clientX, clientY }));
 
-              await new Promise(resolve => setTimeout(resolve, 3000));
-          } else {
-              console.warn(`[${this.name}] New Chat button not found, continuing with current chat.`);
-          }
+          await new Promise(resolve => setTimeout(resolve, 3000));
+        } else {
+          console.warn(`[${this.name}] New Chat button not found, continuing with current chat.`);
+        }
       }
 
       // Find input element (after potential navigation)
@@ -100,64 +157,65 @@ class GeminiProvider {
       }
 
       inputElement.focus();
-      
+
       // Use execCommand for contentEditable or fallback to value/innerText
       if (inputElement.getAttribute('contenteditable') === 'true' || inputElement.contentEditable === 'true') {
         document.execCommand('selectAll', false, null);
         document.execCommand('delete', false, null);
         document.execCommand('insertText', false, textToInput);
-        
+
         if (inputElement.innerText.trim() === "" && textToInput.trim() !== "") {
-            inputElement.innerText = textToInput;
+          inputElement.innerText = textToInput;
         }
       } else {
         inputElement.value = textToInput;
       }
 
       // Trigger events
+      console.log(`[${this.name}] [TRACE-${requestId}] Firing input events to element.`);
       const events = ['input', 'change', 'keyup', 'keydown'];
       events.forEach(type => inputElement.dispatchEvent(new Event(type, { bubbles: true, cancelable: true })));
 
-      await new Promise(resolve => setTimeout(resolve, 1000));
+      console.log(`[${this.name}] [TRACE-${requestId}] Waiting 300ms for state binding...`);
+      await new Promise(resolve => setTimeout(resolve, 300));
 
       for (let attempt = 0; attempt < MAX_RETRIES; attempt++) {
         const sendButton = document.querySelector(this.sendButtonSelector);
         if (sendButton) {
-          const isDisabled = sendButton.disabled || 
-                             sendButton.getAttribute('aria-disabled') === 'true' ||
-                             sendButton.classList.contains('disabled');
-          
+          const isDisabled = sendButton.disabled ||
+            sendButton.getAttribute('aria-disabled') === 'true' ||
+            sendButton.classList.contains('disabled');
+
+          console.log(`[${this.name}] [TRACE-${requestId}] Send button found on attempt ${attempt + 1}. Disabled: ${isDisabled}`);
+
           if (!isDisabled) {
-            console.log(`[${this.name}] Attempting to click send button on attempt ${attempt + 1}`);
-            
+            console.log(`[${this.name}] [TRACE-${requestId}] Clicking send button on attempt ${attempt + 1}`);
+
             const rect = sendButton.getBoundingClientRect();
             const clientX = rect.left + rect.width / 2;
             const clientY = rect.top + rect.height / 2;
-            
+
             sendButton.dispatchEvent(new PointerEvent('pointerdown', { bubbles: true, pointerType: 'mouse', clientX, clientY }));
             sendButton.dispatchEvent(new MouseEvent('mousedown', { bubbles: true, clientX, clientY }));
             sendButton.click();
             sendButton.dispatchEvent(new PointerEvent('pointerup', { bubbles: true, pointerType: 'mouse', clientX, clientY }));
             sendButton.dispatchEvent(new MouseEvent('mouseup', { bubbles: true, clientX, clientY }));
-            
-            inputElement.blur();
-            await new Promise(resolve => setTimeout(resolve, 800));
-            
-            const currentContent = (inputElement.value || inputElement.innerText || "").trim();
-            if (currentContent === "") {
-                console.log(`[${this.name}] Message sent successfully (input cleared).`);
-                return true;
-            }
 
-            // Enter key fallback
-            inputElement.dispatchEvent(new KeyboardEvent('keydown', { key: 'Enter', code: 'Enter', keyCode: 13, which: 13, bubbles: true, cancelable: true }));
-            await new Promise(resolve => setTimeout(resolve, 800));
-            if ((inputElement.value || inputElement.innerText || "").trim() === "") {
-                return true;
-            }
+            inputElement.blur();
+            
+            // Enter key fallback sequence after a tiny delay
+            console.log(`[${this.name}] [TRACE-${requestId}] Dispatching Enter key fallback in 100ms...`);
+            setTimeout(() => {
+              console.log(`[${this.name}] [TRACE-${requestId}] Executing Enter key fallback.`);
+              inputElement.dispatchEvent(new KeyboardEvent('keydown', { key: 'Enter', code: 'Enter', keyCode: 13, which: 13, bubbles: true, cancelable: true }));
+              inputElement.dispatchEvent(new KeyboardEvent('keypress', { key: 'Enter', code: 'Enter', keyCode: 13, which: 13, bubbles: true, cancelable: true }));
+            }, 100);
+
+            console.log(`[${this.name}] [TRACE-${requestId}] sendChatMessage returning true.`);
+            return true;
           }
         }
-        await new Promise(resolve => setTimeout(resolve, 500));
+        await new Promise(resolve => setTimeout(resolve, 300));
       }
 
       this._reportSendError(requestId, "Failed to clear input after all attempts.");
@@ -172,134 +230,389 @@ class GeminiProvider {
   _reportSendError(requestId, errorMessage) {
     const callback = this.pendingResponseCallbacks.get(requestId);
     if (callback) {
-        callback(requestId, `[PROVIDER_SEND_ERROR: ${errorMessage}]`, true); 
-        this.pendingResponseCallbacks.delete(requestId);
+      callback(requestId, `[PROVIDER_SEND_ERROR: ${errorMessage}]`, true);
+      this.pendingResponseCallbacks.delete(requestId);
     }
   }
 
   async _startDOMMonitoring(requestId) {
-    console.log(`[${this.name}] Starting DOM monitoring for requestId: ${requestId}.`);
+    const startTime = Date.now();
+    console.log(`[${this.name}] [TRACE-${requestId}] Starting DOM monitoring. Timestamp: ${startTime}ms`);
     let lastCapturedText = "";
     let noChangeStreak = 0;
     let checkCount = 0;
     
     // Small initial delay to allow Gemini UI to show the "Stop" button or generating indicator
-    await new Promise(resolve => setTimeout(resolve, 1500));
+    await new Promise(resolve => setTimeout(resolve, 500));
 
-    const monitor = () => {
-        checkCount++;
-        const callback = this.pendingResponseCallbacks.get(requestId);
-        if (!callback) {
-            this._stopDOMMonitoring();
-            return;
+    const monitor = async () => {
+      checkCount++;
+      const now = Date.now();
+      const elapsed = now - startTime;
+      const callback = this.pendingResponseCallbacks.get(requestId);
+      if (!callback) {
+        console.log(`[${this.name}] [TRACE-${requestId}] No callback found, stopping monitor at tick ${checkCount}. Elapsed: ${elapsed}ms`);
+        this._stopDOMMonitoring();
+        return;
+      }
+      
+      const captureResult = this.captureResponse();
+      const currentText = captureResult.text;
+      const isStillGenerating = captureResult.isStillGenerating;
+      let isFinalDOMResponse = false;
+      
+      if (currentText && currentText !== lastCapturedText) {
+        console.log(`[${this.name}] [TRACE-${requestId}] Text updated (len: ${currentText.length}) at tick ${checkCount}. Elapsed: ${elapsed}ms`);
+        lastCapturedText = currentText;
+        noChangeStreak = 0;
+      } else if (currentText === lastCapturedText) {
+        noChangeStreak++;
+        if (currentText.trim() !== "") {
+          console.log(`[${this.name}] [TRACE-${requestId}] Text unchanged at tick ${checkCount}. Streak: ${noChangeStreak}. Elapsed: ${elapsed}ms`);
         }
+      }
+
+      // Only mark final if we are NOT generating AND we have a stable response
+      if (!isStillGenerating && noChangeStreak >= 2 && lastCapturedText.trim() !== "") {
+        console.log(`[${this.name}] [TRACE-${requestId}] Done: generating stopped, stable streak reached. Elapsed: ${elapsed}ms`);
+        isFinalDOMResponse = true;
+      }
+
+      // STABLE-TEXT FALLBACK: If text is unchanged for 1.0s (4 checks) and non-empty, finalize instantly
+      if (noChangeStreak >= 4 && lastCapturedText.trim() !== "") {
+        console.log(`[${this.name}] [TRACE-${requestId}] Done: stable-text fallback triggered (1.0s no change). Elapsed: ${elapsed}ms`);
+        isFinalDOMResponse = true;
+      }
+
+      if (!isStillGenerating && noChangeStreak >= 40 && lastCapturedText.trim() === "" && checkCount > 40) {
+        console.log(`[${this.name}] [TRACE-${requestId}] Done: empty timeout reached. Elapsed: ${elapsed}ms`);
+        isFinalDOMResponse = true;
+      }
+      
+      if (checkCount > 120) {
+        console.log(`[${this.name}] [TRACE-${requestId}] Done: hard timeout (30s) reached. Elapsed: ${elapsed}ms`);
+        isFinalDOMResponse = true;
+      }
+
+      if (isFinalDOMResponse) {
+        console.log(`[${this.name}] [TRACE-${requestId}] Finalizing. Elapsed: ${now - startTime}ms. Attempting copy button capture...`);
+
+        // OPTIMIZATION: Try to get perfect text from Copy button
+        const copyStartTime = Date.now();
+        const perfectText = await this._captureFromCopyButton(this._currentExpectedIndex);
+        console.log(`[${this.name}] [TRACE-${requestId}] Copy button capture finished. Took: ${Date.now() - copyStartTime}ms. Success: ${!!perfectText}`);
         
-        const captureResult = this.captureResponse();
-        const currentText = captureResult.text;
-        const isStillGenerating = captureResult.isStillGenerating;
-        let isFinalDOMResponse = false;
-        
-        if (currentText && currentText !== lastCapturedText) {
-            lastCapturedText = currentText;
-            noChangeStreak = 0;
-            callback(requestId, currentText, false);
-        } else if (currentText === lastCapturedText) {
-            noChangeStreak++;
+        if (perfectText) {
+            lastCapturedText = perfectText;
         }
 
-        // Only mark final if we are NOT generating AND we have a stable response
-        // Increase streak requirement for short responses to avoid premature cutoffs
-        const requiredStreak = lastCapturedText.length < 50 ? 10 : 5;
-        if (!isStillGenerating && noChangeStreak >= requiredStreak && lastCapturedText.trim() !== "") {
-            isFinalDOMResponse = true;
-        }
-
-        // If we've been waiting for a while and have NO text and NO generating signal, assume something is wrong and finish
-        if (!isStillGenerating && noChangeStreak >= 20 && lastCapturedText.trim() === "" && checkCount > 10) {
-            console.log(`[${this.name}] No text found after polling and no generating signal. Finishing.`);
-            isFinalDOMResponse = true;
-        }
-        
-        // Safety timeout (approx 30s)
-        if (checkCount > 120) isFinalDOMResponse = true;
-
-        if (isFinalDOMResponse) {
-            console.log(`[${this.name}] DOM monitoring finished for ${requestId}. Final length: ${lastCapturedText.length}`);
-            callback(requestId, lastCapturedText, true);
-            this.pendingResponseCallbacks.delete(requestId);
-            this._stopDOMMonitoring();
+        const cleanedText = this._cleanResponse(lastCapturedText || "");
+        if (cleanedText.trim() === "") {
+            callback(requestId, "[Empty response captured - possibly an image or widget without text]", true);
         } else {
-            this.domMonitorTimer = setTimeout(monitor, 250); // Poll faster for smoother updates
+            callback(requestId, cleanedText, true);
         }
+        this.pendingResponseCallbacks.delete(requestId);
+        this._stopDOMMonitoring();
+      } else {
+        this.domMonitorTimer = setTimeout(monitor, 250);
+      }
     };
     monitor();
   }
 
+  async _captureFromCopyButton(expectedIndex) {
+    console.log(`[${this.name}] Attempting to capture from Copy button via event interception. Expected index: ${expectedIndex}`);
+    return new Promise(async (resolve) => {
+        let capturedText = null;
+        
+        // Listener to intercept the copy event
+        const onCopy = (e) => {
+            const text = e.clipboardData.getData('text/plain');
+            if (text && text.trim().length > 0) {
+                console.log(`[${this.name}] Successfully intercepted copy event! Text length: ${text.length}`);
+                capturedText = text.trim();
+
+                // Block the copy from hitting the system clipboard and stop UI popups
+                e.preventDefault();
+                e.stopImmediatePropagation();
+            }
+        };
+
+        try {
+            document.addEventListener('copy', onCopy, true);
+
+            // Helper to recursively pierce all Shadow DOMs and find matching elements
+            const findDeep = (root, selector) => {
+                const results = [];
+                const search = (node) => {
+                    if (!node) return;
+                    if (node.matches && node.matches(selector)) {
+                        results.push(node);
+                    }
+                    if (node.querySelectorAll) {
+                        const direct = node.querySelectorAll(selector);
+                        for (const el of direct) {
+                            if (!results.includes(el)) {
+                                results.push(el);
+                            }
+                        }
+                    }
+                    if (node.shadowRoot) {
+                        search(node.shadowRoot);
+                    }
+                    let child = node.firstElementChild;
+                    while (child) {
+                        search(child);
+                        child = child.nextElementSibling;
+                    }
+                };
+                search(root);
+                return results;
+            };
+
+            const getActiveCopyButton = () => {
+                const hosts = findDeep(document, 'model-response message-content');
+                if (expectedIndex === null || expectedIndex === undefined || expectedIndex >= hosts.length) {
+                    return null;
+                }
+                const activeHost = hosts[expectedIndex];
+                let container = activeHost.closest('model-response, [role="article"], .model-response');
+                if (!container) {
+                    container = activeHost.parentElement || activeHost;
+                }
+                
+                // Find all potential copy buttons inside the container
+                const btns = findDeep(container, 'button[data-test-id="copy-button"], button[data-testid="copy-button"], button[aria-label="Copy"], button[aria-label*="Copy" i], [data-test-id*="copy" i], [data-testid*="copy" i]');
+                
+                // Filter to find the main copy button (prefer exact aria-label="Copy" or data-test-id, exclude code copy)
+                const mainBtn = btns.find(btn => {
+                    const label = (btn.getAttribute('aria-label') || "").trim().toLowerCase();
+                    return label === 'copy' || btn.getAttribute('data-test-id') === 'copy-button' || btn.getAttribute('data-testid') === 'copy-button';
+                });
+                
+                return mainBtn || btns[0] || null;
+            };
+
+            // Wait for the copy button of our expected active turn to appear in the DOM
+            let targetButton = getActiveCopyButton();
+            let waitTime = 0;
+            const checkInterval = 50;
+            const maxWait = 2000;
+
+            if (expectedIndex !== null && expectedIndex !== undefined) {
+                console.log(`[${this.name}] [TRACE-COPY] Waiting for active copy button to appear for expectedIndex: ${expectedIndex}`);
+                while (!targetButton && waitTime < maxWait) {
+                    await new Promise(r => setTimeout(r, checkInterval));
+                    waitTime += checkInterval;
+                    targetButton = getActiveCopyButton();
+                }
+                console.log(`[${this.name}] [TRACE-COPY] Finished waiting for active copy button. Found: ${!!targetButton}, waited: ${waitTime}ms`);
+            }
+
+            if (!targetButton) {
+                console.log(`[${this.name}] [TRACE-COPY] Target copy button not found, aborting copy capture.`);
+                document.removeEventListener('copy', onCopy, true);
+                return resolve(null);
+            }
+
+            // CRITICAL: Reset clipboard interception text BEFORE clicking, because the click event
+            // executes fully synchronously and populates the text synchronously!
+            this._lastInterceptedClipboardText = null;
+
+            console.log(`[${this.name}] [TRACE-COPY] Scrolling to and clicking copy button:`, targetButton);
+            targetButton.scrollIntoView({ block: 'center' });
+            
+            // Programmatic click
+            targetButton.click();
+            
+            // Wait up to 1.5s for the copy event
+            let clipboardWaitTime = 0;
+
+            const waitLoop = setInterval(() => {
+                clipboardWaitTime += checkInterval;
+                const foundText = capturedText || this._lastInterceptedClipboardText;
+                if (foundText) {
+                    console.log(`[${this.name}] [TRACE-COPY] Captured text successfully from clipboard after ${clipboardWaitTime}ms! Text len: ${foundText.length}`);
+                    clearInterval(waitLoop);
+                    document.removeEventListener('copy', onCopy, true);
+                    resolve(foundText);
+                } else if (clipboardWaitTime >= maxWait) {
+                    console.log(`[${this.name}] [TRACE-COPY] Timeout waiting for copy event (${maxWait}ms reached).`);
+                    clearInterval(waitLoop);
+                    document.removeEventListener('copy', onCopy, true);
+                    resolve(null);
+                }
+            }, checkInterval);
+
+        } catch (err) {
+            console.error(`[${this.name}] Error in copy interception:`, err);
+            document.removeEventListener('copy', onCopy, true);
+            resolve(null);
+        }
+    });
+  }
+
+  async _readClipboard() {
+    return null; // Redirect to interception
+  }
+
   _stopDOMMonitoring() {
     if (this.domMonitorTimer) {
-        clearTimeout(this.domMonitorTimer);
-        this.domMonitorTimer = null;
+      clearTimeout(this.domMonitorTimer);
+      this.domMonitorTimer = null;
     }
   }
 
   // Standard method name used by content.js - with Shadow DOM piercing
   captureResponse() {
     console.log(`[${this.name}] captureResponse ENTER`);
-    
-    // Helper to search inside shadow roots
+
+    // Helper to recursively pierce all Shadow DOMs and find matching elements
     const findDeep = (root, selector) => {
-        const elements = Array.from(root.querySelectorAll(selector));
-        const shadowElements = Array.from(root.querySelectorAll('*'))
-            .filter(el => el.shadowRoot)
-            .flatMap(el => findDeep(el.shadowRoot, selector));
-        return [...elements, ...shadowElements];
+      const results = [];
+      const search = (node) => {
+        if (!node) return;
+        
+        // Match current node
+        if (node.matches && node.matches(selector)) {
+          results.push(node);
+        }
+        
+        // Also query direct descendants if matches isn't enough, or to collect sub-elements
+        if (node.querySelectorAll) {
+          const direct = node.querySelectorAll(selector);
+          for (const el of direct) {
+            if (!results.includes(el)) {
+              results.push(el);
+            }
+          }
+        }
+        
+        // Pierce Shadow Root if present
+        if (node.shadowRoot) {
+          search(node.shadowRoot);
+        }
+        
+        // Traverse standard children
+        let child = node.firstElementChild;
+        while (child) {
+          search(child);
+          child = child.nextElementSibling;
+        }
+      };
+      
+      search(root);
+      return results;
     };
+
+    // Safeguard: Ensure the target turn's message-content host has actually been created in the DOM
+    const hosts = findDeep(document, 'model-response message-content');
+    if (this._currentExpectedIndex === null || this._currentExpectedIndex === undefined || hosts.length <= this._currentExpectedIndex) {
+      console.log(`[${this.name}] [TRACE-SAFEGUARD] Expected host at index ${this._currentExpectedIndex} not created yet (hosts count: ${hosts.length}). Returning empty pending state.`);
+      return {
+        found: false,
+        text: "",
+        isStillGenerating: true,
+        isDefinitelyFinal: false
+      };
+    }
+
+    if (this._lastDOMText !== null) {
+      console.log(`[${this.name}] Using real-time main world DOM text (len: ${this._lastDOMText.length}, generating: ${this._lastDOMIsGenerating}).`);
+      return {
+        found: this._lastDOMText.length > 0,
+        text: this._lastDOMText,
+        isStillGenerating: this._lastDOMIsGenerating,
+        isDefinitelyFinal: !this._lastDOMIsGenerating && this._lastDOMText.length > 0
+      };
+    }
 
     // Try primary and fallback selectors with shadow piercing
     let responseElements = findDeep(document, this.responseSelector);
 
+    // If we have an expected index, ONLY look at elements inside that expected host!
+    if (this._currentExpectedIndex !== null && this._currentExpectedIndex !== undefined) {
+        if (hosts.length > this._currentExpectedIndex) {
+            const activeHost = hosts[this._currentExpectedIndex];
+            // Filter responseElements to ONLY those that are descendants of activeHost
+            responseElements = responseElements.filter(el => activeHost.contains(el) || activeHost === el);
+            if (responseElements.length === 0) {
+                // If the host exists but has no markdown elements yet, just use the host itself
+                responseElements = [activeHost];
+            }
+        }
+    }
     // Filter out elements that are likely part of the "Welcome/Home" screen chips or sidebar
     const isExcluded = (el) => {
-        const text = el.innerText || "";
-        // Gemini welcome screen often contains these strings
-        if (text.includes("Create image") || text.includes("Help me learn") || text.includes("Boost my day") || text.includes("Create music")) {
-            return true;
-        }
-        // Exclude sidebar/history items specifically
-        if (el.closest('nav, [role="navigation"], .sidebar, .chat-history, [id*="history"]')) {
-            return true;
-        }
-        // Exclude very short snippets that look like titles
-        if (text.length < 20 && responseElements.length > 1) {
-            return true;
-        }
-        return false;
+      const text = el.innerText || "";
+      // Gemini welcome screen often contains these strings
+      if (text.includes("Create image") || text.includes("Help me learn") || text.includes("Boost my day") || text.includes("Create music")) {
+        return true;
+      }
+      // Exclude sidebar/history items specifically
+      if (el.closest('nav, [role="navigation"], .sidebar, .chat-history, [id*="history"]')) {
+        return true;
+      }
+      return false;
     };
 
-    responseElements = responseElements.filter(el => !isExcluded(el));
-
-    console.log(`[${this.name}] Primary search found ${responseElements.length} elements.`);
-
-    if (responseElements.length === 0) {
-        responseElements = findDeep(document, 'message-content, .model-response-text, .markdown, .response-container');
-        responseElements = responseElements.filter(el => !isExcluded(el));
-        console.log(`[${this.name}] Fallback search found ${responseElements.length} elements.`);
-    }
-
-    // Final desperate search - only if we didn't find anything and we are SURE we're not on the home page suggestions
-    if (responseElements.length === 0) {
-        responseElements = findDeep(document, 'div').filter(el => {
-            const text = (el.innerText || "").trim();
-            const isHomeSuggestion = text.includes("Create image") || text.includes("Help me learn") || text.includes("Boost my day") || text.includes("Create music");
-            // Also filter out standard UI labels
-            const isUILabel = text === "Gemini" || text === "Enter a prompt here" || text === "New chat";
+    const isVisible = (el) => {
+      try {
+        if (!el) return false;
+        const rect = el.getBoundingClientRect();
+        const style = window.getComputedStyle(el);
+        
+        // Log dimensions - elements with display: contents are fully visible but have no layout box/size.
+        if (rect.width === 0 && rect.height === 0 && style.display !== 'contents') {
+          console.log(`[${this.name}] isVisible [REJECTED-dimensions]: el has 0x0 size for tag: ${el.tagName}`);
+          return false;
+        }
+        
+        if (style.display === 'none' || style.visibility === 'hidden') {
+          console.log(`[${this.name}] isVisible [REJECTED-style]: display=${style.display}, visibility=${style.visibility} for tag: ${el.tagName}`);
+          return false;
+        }
+        
+        // Traverse parents safely, piercing Shadow DOM boundaries
+        let parent = el.parentElement || (el.parentNode && el.parentNode.host);
+        while (parent) {
+            // ShadowRoot is a DocumentFragment, skip it and go to its host
+            if (parent instanceof DocumentFragment) {
+                parent = parent.host;
+                continue;
+            }
+            if (parent.nodeType !== Node.ELEMENT_NODE) {
+                parent = parent.parentElement || (parent.parentNode && parent.parentNode.host);
+                continue;
+            }
             
-            // Check for sidebar again in desperate search
-            const isSidebar = el.closest('nav, [role="navigation"], .sidebar, .chat-history, [id*="history"], .chat-title');
+            const parentStyle = window.getComputedStyle(parent);
+            if (parentStyle.display === 'none' || parentStyle.visibility === 'hidden') {
+                console.log(`[${this.name}] isVisible [REJECTED-parent]: hidden parent ${parent.tagName}`);
+                return false;
+            }
+            parent = parent.parentElement || (parent.parentNode && parent.parentNode.host);
+        }
+        
+        return true;
+      } catch (err) {
+        console.error(`[${this.name}] isVisible CRASHED:`, err.message, err.stack);
+        return false;
+      }
+    };
 
-            return text.length > 50 && !isHomeSuggestion && !isUILabel && !isSidebar && !el.querySelector('textarea') && !el.querySelector('input');
-        });
-        console.log(`[${this.name}] Desperate search found ${responseElements.length} elements.`);
+    console.log(`[${this.name}] Raw findDeep search matched ${responseElements.length} elements before filtering.`);
+
+    responseElements = responseElements.filter(el => !isExcluded(el) && isVisible(el));
+
+    console.log(`[${this.name}] Primary search found ${responseElements.length} visible elements.`);
+
+    if (responseElements.length === 0) {
+      responseElements = findDeep(document, 'message-content, .model-response-text, .markdown-renderer, .markdown, .response-container');
+      console.log(`[${this.name}] Raw fallback findDeep matched ${responseElements.length} elements.`);
+      responseElements = responseElements.filter(el => !isExcluded(el) && isVisible(el));
+      console.log(`[${this.name}] Fallback search found ${responseElements.length} visible elements.`);
     }
 
     const lastResponse = responseElements[responseElements.length - 1];
@@ -310,32 +623,32 @@ class GeminiProvider {
 
     // Safety check: if text exactly matches the prompt, it might be the user message echoing back
     if (this.lastSentMessage && text === this.lastSentMessage.trim()) {
-        console.log(`[${this.name}] Extracted text matches last sent message. Skipping.`);
-        text = "";
+      console.log(`[${this.name}] Extracted text matches last sent message. Skipping.`);
+      text = "";
     }
 
     console.log(`[${this.name}] Extracted text length: ${text.length}. Sample: "${text.substring(0, 50)}..."`);
-    
+
     // Check for thinking indicator
     const thinkingNodes = [
-        ...findDeep(document, this.thinkingIndicatorSelector),
-        ...findDeep(document, '.blue-circle'),
-        ...findDeep(document, '.typing-indicator'),
-        ...findDeep(document, 'button[aria-label="Stop response"]')
+      ...findDeep(document, this.thinkingIndicatorSelector),
+      ...findDeep(document, '.blue-circle'),
+      ...findDeep(document, '.typing-indicator'),
+      ...findDeep(document, 'button[aria-label="Stop response"]')
     ];
-                     
+
     const isStillGenerating = thinkingNodes.some(node => {
-        if (!node) return false;
-        // Check if visible
-        const style = window.getComputedStyle(node);
-        return style.display !== 'none' && style.visibility !== 'hidden' && node.offsetParent !== null;
+      if (!node) return false;
+      // Check if visible
+      const style = window.getComputedStyle(node);
+      return style.display !== 'none' && style.visibility !== 'hidden' && node.offsetParent !== null;
     });
-    
+
     console.log(`[${this.name}] isStillGenerating: ${isStillGenerating} (Found ${thinkingNodes.length} indicator nodes)`);
-    
-    const result = { 
-      found: text.length > 0, 
-      text, 
+
+    const result = {
+      found: text.length > 0,
+      text,
       isStillGenerating,
       elementCount: responseElements.length
     };
@@ -346,32 +659,25 @@ class GeminiProvider {
 
   // Helper to strip Gemini's UI-specific labels and boilerplate
   _cleanResponse(text) {
-      if (!text) return "";
-      
-      let cleaned = text;
+    if (!text) return "";
+    
+    // Gemini "Copy" button boilerplate removal
+    // It often starts with "Conversation with Gemini\nYou said\n...\nGemini said\n"
+    if (text.includes("Gemini said")) {
+        const parts = text.split("Gemini said");
+        // Take the part after the last "Gemini said" to get the latest response
+        text = parts[parts.length - 1];
+    }
+    
+    // Remove footer noise if present
+    const footerMarkers = ["Tools\nFast", "Gemini is AI and can make mistakes"];
+    for (const marker of footerMarkers) {
+        if (text.includes(marker)) {
+            text = text.split(marker)[0];
+        }
+    }
 
-      // 1. Remove "Conversation with Gemini" header
-      cleaned = cleaned.replace(/^Conversation with Gemini\s*/i, "");
-
-      // 2. If it's a sequence like "You said... Gemini said...", extract only what's after "Gemini said"
-      if (cleaned.includes("Gemini said")) {
-          const parts = cleaned.split(/Gemini said/i);
-          cleaned = parts[parts.length - 1].trim();
-      }
-
-      // 3. Remove footers/disclaimers
-      const footers = [
-          /Tools\s*Fast\s*/gi,
-          /Gemini is AI and can make mistakes\./gi,
-          /Check for accuracy\./gi,
-          /Google may use your conversations to improve its products/gi
-      ];
-
-      footers.forEach(regex => {
-          cleaned = cleaned.replace(regex, "");
-      });
-
-      return cleaned.trim();
+    return text.trim();
   }
 
   getResponseText(element) {
@@ -391,18 +697,23 @@ class GeminiProvider {
     // Reset accumulator for this request
     this.requestAccumulators.set(requestId, { text: "", isDefinitelyFinal: false });
 
+    // Reset expected index and telemetry variables to isolate new request
+    this._currentExpectedIndex = null;
+    this._lastDOMText = null;
+    this._lastDOMIsGenerating = true;
+
     if (this.captureMethod === "debugger") {
       console.log(`[${this.name}] Debugger capture initiated. Requesting debugger attachment.`);
 
       const patterns = this.getStreamingApiPatterns();
       await new Promise(resolve => {
         chrome.runtime.sendMessage({
-            type: "SET_DEBUGGER_TARGETS",
-            providerName: this.name,
-            patterns: patterns
+          type: "SET_DEBUGGER_TARGETS",
+          providerName: this.name,
+          patterns: patterns
         }, response => {
-            console.log(`[${this.name}] SET_DEBUGGER_TARGETS response:`, response);
-            resolve();
+          console.log(`[${this.name}] SET_DEBUGGER_TARGETS response:`, response);
+          resolve();
         });
       });
 
@@ -434,30 +745,30 @@ class GeminiProvider {
     if (accumulator.isDefinitelyFinal) return;
 
     if (rawData && rawData.trim() !== "") {
-        const parseOutput = this.parseDebuggerResponse(rawData);
+      const parseOutput = this.parseDebuggerResponse(rawData);
 
-        if (accumulator.text.length === 0 && parseOutput.text) {
-          console.log(`[${this.name}] First debugger data received for ${requestId}. Disabling DOM fallback timer.`);
-          if (this.domFallbackTimer) {
-              clearTimeout(this.domFallbackTimer);
-              this.domFallbackTimer = null;
-          }
+      if (accumulator.text.length === 0 && parseOutput.text) {
+        console.log(`[${this.name}] First debugger data received for ${requestId}. Disabling DOM fallback timer.`);
+        if (this.domFallbackTimer) {
+          clearTimeout(this.domFallbackTimer);
+          this.domFallbackTimer = null;
         }
+      }
 
-        if (parseOutput.text !== null) {
-            accumulator.text = parseOutput.text;
-        }
+      if (parseOutput.text !== null) {
+        accumulator.text = parseOutput.text;
+      }
 
-        if (parseOutput.isFinalResponse) {
-            accumulator.isDefinitelyFinal = true;
-        }
-
-        if (parseOutput.text !== null || accumulator.isDefinitelyFinal) {
-          callback(requestId, accumulator.text, accumulator.isDefinitelyFinal);
-        }
-    } else if (isFinalFromBackground && !accumulator.isDefinitelyFinal) {
+      if (parseOutput.isFinalResponse) {
         accumulator.isDefinitelyFinal = true;
-        callback(requestId, accumulator.text, true);
+      }
+
+      if (parseOutput.text !== null || accumulator.isDefinitelyFinal) {
+        callback(requestId, accumulator.text, accumulator.isDefinitelyFinal);
+      }
+    } else if (isFinalFromBackground && !accumulator.isDefinitelyFinal) {
+      accumulator.isDefinitelyFinal = true;
+      callback(requestId, accumulator.text, true);
     }
 
     if (accumulator.isDefinitelyFinal) {
@@ -473,63 +784,63 @@ class GeminiProvider {
     if (!rawDataString) return { text, isFinalResponse };
 
     try {
-        // Gemini often returns chunks that are arrays like [["something", ...]]
-        // or multiple such arrays separated by newlines or numbers (length prefixes).
+      // Gemini often returns chunks that are arrays like [["something", ...]]
+      // or multiple such arrays separated by newlines or numbers (length prefixes).
 
-        // Strategy: find all JSON-like array structures and extract the longest string
-        // which is almost always the actual response content.
+      // Strategy: find all JSON-like array structures and extract the longest string
+      // which is almost always the actual response content.
 
-        const chunks = rawDataString.split("\n");
-        let bestText = "";
+      const chunks = rawDataString.split("\n");
+      let bestText = "";
 
-        for (const chunk of chunks) {
-            if (!chunk.trim()) continue;
+      for (const chunk of chunks) {
+        if (!chunk.trim()) continue;
 
-            // Try to find array patterns
-            const matches = chunk.match(/\[[\s\S]*\]/g);
-            if (matches) {
-                for (const match of matches) {
-                    try {
-                        const parsed = JSON.parse(match);
-                        // Recursively search for the longest string in the parsed object
-                        const findLongestString = (obj) => {
-                            let longest = "";
-                            if (typeof obj === 'string') return obj;
-                            if (Array.isArray(obj)) {
-                                obj.forEach(item => {
-                                    const s = findLongestString(item);
-                                    if (s.length > longest.length) longest = s;
-                                });
-                            } else if (typeof obj === 'object' && obj !== null) {
-                                Object.values(obj).forEach(val => {
-                                    const s = findLongestString(val);
-                                    if (s.length > longest.length) longest = s;
-                                });
-                            }
-                            return longest;
-                        };
-
-                        const candidate = findLongestString(parsed);
-                        if (candidate.length > bestText.length) {
-                            bestText = candidate;
-                        }
-                    } catch (e) {
-                        // Not valid JSON array, skip
-                    }
+        // Try to find array patterns
+        const matches = chunk.match(/\[[\s\S]*\]/g);
+        if (matches) {
+          for (const match of matches) {
+            try {
+              const parsed = JSON.parse(match);
+              // Recursively search for the longest string in the parsed object
+              const findLongestString = (obj) => {
+                let longest = "";
+                if (typeof obj === 'string') return obj;
+                if (Array.isArray(obj)) {
+                  obj.forEach(item => {
+                    const s = findLongestString(item);
+                    if (s.length > longest.length) longest = s;
+                  });
+                } else if (typeof obj === 'object' && obj !== null) {
+                  Object.values(obj).forEach(val => {
+                    const s = findLongestString(val);
+                    if (s.length > longest.length) longest = s;
+                  });
                 }
+                return longest;
+              };
+
+              const candidate = findLongestString(parsed);
+              if (candidate.length > bestText.length) {
+                bestText = candidate;
+              }
+            } catch (e) {
+              // Not valid JSON array, skip
             }
+          }
         }
+      }
 
-        if (bestText.length > 0) {
-            text = bestText;
-        }
+      if (bestText.length > 0) {
+        text = bestText;
+      }
 
-        // Gemini completion indicators
-        if (rawDataString.includes("xsrf_token") || rawDataString.includes("finish_reason")) {
-            // isFinalResponse = true;
-        }
+      // Gemini completion indicators
+      if (rawDataString.includes("xsrf_token") || rawDataString.includes("finish_reason")) {
+        // isFinalResponse = true;
+      }
     } catch (e) {
-        console.warn(`[${this.name}] Error parsing debugger response:`, e);
+      console.warn(`[${this.name}] Error parsing debugger response:`, e);
     }
 
     return { text, isFinalResponse };
@@ -565,13 +876,13 @@ class GeminiProvider {
 
 // Robust registration
 (function register() {
-    if (window.providerUtils) {
-        console.log("GeminiProvider: Registering...");
-        const providerInstance = new GeminiProvider();
-        window.providerUtils.registerProvider(providerInstance.name, providerInstance.supportedDomains, providerInstance);
-        console.log("GeminiProvider: Registered successfully.");
-    } else {
-        console.log("GeminiProvider: Waiting for providerUtils...");
-        setTimeout(register, 500);
-    }
+  if (window.providerUtils) {
+    console.log("GeminiProvider: Registering...");
+    const providerInstance = new GeminiProvider();
+    window.providerUtils.registerProvider(providerInstance.name, providerInstance.supportedDomains, providerInstance);
+    console.log("GeminiProvider: Registered successfully.");
+  } else {
+    console.log("GeminiProvider: Waiting for providerUtils...");
+    setTimeout(register, 500);
+  }
 })();
