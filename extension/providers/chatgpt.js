@@ -20,7 +20,7 @@
 class ChatGptProvider {
   constructor() {
     // --- START OF CONFIGURABLE PROPERTIES ---
-    this.captureMethod = "debugger"; // Default value
+    this.captureMethod = "dom"; // Default to DOM to avoid 'Unusual Activity' flags from debugger
     this.debuggerUrlPattern = "*://chatgpt.com/*"; // Broadened to catch all variations
     this.includeThinkingInMessage = false;
     // --- END OF CONFIGURABLE PROPERTIES ---
@@ -37,17 +37,29 @@ class ChatGptProvider {
     this.pendingResponseCallbacks = new Map();
     this.requestAccumulators = new Map();
     this.domMonitorTimer = null;
-    this.domFallbackTimeout = 15000; // Increased to 15s to allow for slow LLM starts and debugger lag
+    this.domFallbackTimeout = 30000; // Increased to 30s to allow for slow image/citation generation
     this.domFallbackTimer = null;
 
+    this._injectClipboardProxy();
     this._loadSettings();
     console.log(`[${this.name}] Provider initialized for domains: ${this.supportedDomains.join(', ')}`);
   }
 
+  _injectClipboardProxy() {
+      // Listen for the custom message in the content script context.
+      // The background script handles the actual proxy.js injection into the tab's MAIN world.
+      window.addEventListener('message', (e) => {
+          if (e.data && e.data.type === 'RELAY_CLIPBOARD_CAPTURE') {
+              this._lastInterceptedClipboardText = e.data.detail;
+              console.log('[ChatGptProvider] Received intercepted text from proxy message event.');
+          }
+      });
+  }
+
   _loadSettings() {
-    chrome.storage.sync.get({ chatGptCaptureMethod: 'debugger' }, (items) => {
+    chrome.storage.sync.get({ chatGptCaptureMethod: 'dom' }, (items) => {
       this.captureMethod = items.chatGptCaptureMethod;
-      console.log(`[${this.name}] Capture method updated to: ${this.captureMethod}`);
+      console.log(`[${this.name}] Settings loaded. Capture method: ${this.captureMethod}`);
     });
   }
 
@@ -64,6 +76,15 @@ class ChatGptProvider {
     }
 
     try {
+      let expectedIndex = 0;
+      const isNewChat = typeof messageOrId === 'object' && messageOrId.settings && messageOrId.settings.new_chat;
+      if (!isNewChat) {
+          const existingHosts = document.querySelectorAll('[data-message-author-role="assistant"]');
+          expectedIndex = existingHosts.length;
+      }
+      this._currentExpectedIndex = expectedIndex;
+      console.log(`[${this.name}] Calculated expectedIndex: ${expectedIndex}`);
+
       let textToInput = "";
       if (typeof messageContent === 'string') {
         textToInput = messageContent;
@@ -158,7 +179,7 @@ class ChatGptProvider {
           activeInputField.dispatchEvent(new Event(type, { bubbles: true, cancelable: true }));
       });
       
-      await new Promise(resolve => setTimeout(resolve, 1000)); 
+      await new Promise(resolve => setTimeout(resolve, 300)); 
 
       for (let attempt = 0; attempt < MAX_RETRIES; attempt++) {
         const sendButton = document.querySelector(this.sendButtonSelector);
@@ -185,35 +206,21 @@ class ChatGptProvider {
             // Final blur to trigger any pending state updates
             activeInputField.blur();
             
-            // Wait to see if it worked (input should clear)
-            await new Promise(resolve => setTimeout(resolve, 500));
-            let currentContent = (activeInputField.value || activeInputField.innerText || "").trim();
-            if (currentContent === "") {
-                console.log(`[${this.name}] Message sent successfully (input cleared via button).`);
-                return true;
-            }
+            // Enter key fallback sequence after a tiny delay
+            setTimeout(() => {
+              activeInputField.dispatchEvent(new KeyboardEvent('keydown', { key: 'Enter', code: 'Enter', keyCode: 13, which: 13, bubbles: true, cancelable: true }));
+              activeInputField.dispatchEvent(new KeyboardEvent('keypress', { key: 'Enter', code: 'Enter', keyCode: 13, which: 13, bubbles: true, cancelable: true }));
+            }, 100);
 
-            // If button didn't work quickly, try Enter key right away
-            console.log(`[${this.name}] Button click didn't clear input, trying Enter key...`);
-            activeInputField.dispatchEvent(new KeyboardEvent('keydown', { key: 'Enter', code: 'Enter', keyCode: 13, which: 13, bubbles: true, cancelable: true }));
-            activeInputField.dispatchEvent(new KeyboardEvent('keypress', { key: 'Enter', code: 'Enter', keyCode: 13, which: 13, bubbles: true, cancelable: true }));
-            
-            await new Promise(resolve => setTimeout(resolve, 500));
-            currentContent = (activeInputField.value || activeInputField.innerText || "").trim();
-            if (currentContent === "") {
-                console.log(`[${this.name}] Message sent successfully (input cleared via Enter fallback).`);
-                return true;
-            }
+            return true;
           }
         }
         
-        console.warn(`[${this.name}] Send attempt ${attempt + 1} failed to clear input.`);
-        activeInputField.dispatchEvent(new Event('input', { bubbles: true }));
-        await new Promise(resolve => setTimeout(resolve, 500));
+        await new Promise(resolve => setTimeout(resolve, 300));
       }
 
       // Final failure
-      this._reportSendError(requestId, "All send attempts (button and Enter key) failed to clear input.");
+      this._reportSendError(requestId, "All send attempts (button and Enter key) failed.");
       return false;
 
     } catch (error) {
@@ -342,32 +349,20 @@ class ChatGptProvider {
               accumulator.isDefinitelyFinal = true;
           }
           
-          // Invoke callback if there's new text
-          if (parseOutput.text !== null || parseOutput.operation === "replace") {
-            callback(requestId, accumulator.text, false); // Always non-final here, finality handled below
-          }
+          // DISABLED: No intermediate streaming to avoid partial/noisy captures
+          // if (parseOutput.text !== null || parseOutput.operation === "replace") {
+          //   callback(requestId, accumulator.text, false); 
+          // }
 
-          // If we flagged it as final, only report it if we actually have text
           if (accumulator.isDefinitelyFinal) {
-              if (accumulator.text.trim().length > 0) {
-                  callback(requestId, accumulator.text, true);
-              } else {
-                  console.log(`[${this.name}] Debugger flagged final but text is empty. Falling back to DOM.`);
-                  accumulator.isDefinitelyFinal = false; 
-                  this._startDOMMonitoring(requestId);
-              }
+              console.log(`[${this.name}] handleDebuggerData - Stream finished. Finalizing.`);
+              this._finalizeResponse(requestId);
           }
       }
     } else {
       if (isFinalFromBackground && !accumulator.isDefinitelyFinal) {
-          // If the network request is done but we have NO text, fall back to DOM immediately
-          if (accumulator.text.length === 0) {
-              console.log(`[${this.name}] handleDebuggerData - Network request finished with NO text. Starting DOM fallback.`);
-              this._startDOMMonitoring(requestId);
-          } else {
-              accumulator.isDefinitelyFinal = true;
-              callback(requestId, accumulator.text, true);
-          }
+          console.log(`[${this.name}] handleDebuggerData - Network request finished. Finalizing.`);
+          this._finalizeResponse(requestId);
       }
     }
 
@@ -723,29 +718,118 @@ class ChatGptProvider {
   }
 
   _captureResponseDOM(element = null) {
+    // Use structural reconstruction for high-fidelity DOM capture
+    const reconstructMarkdown = (node) => {
+        if (!node) return "";
+        if (node.nodeType === Node.TEXT_NODE) return node.textContent;
+        if (node.nodeType !== Node.ELEMENT_NODE) return "";
+
+        const tagName = node.tagName.toLowerCase();
+        let prefix = "";
+        let suffix = "";
+
+        // Skip UI-only noise
+        if (node.classList.contains('sr-only') || node.getAttribute('aria-hidden') === 'true') return "";
+
+        switch (tagName) {
+            case 'p': suffix = "\n\n"; break;
+            case 'br': suffix = "\n"; break;
+            case 'strong': case 'b': prefix = "**"; suffix = "**"; break;
+            case 'em': case 'i': prefix = "*"; suffix = "*"; break;
+            case 'code':
+                if (node.parentElement && node.parentElement.tagName.toLowerCase() === 'pre') {
+                    prefix = "```\n"; suffix = "\n```\n";
+                } else {
+                    prefix = "`"; suffix = "`";
+                }
+                break;
+            case 'a':
+                const href = node.getAttribute('href');
+                const title = node.getAttribute('title') || node.innerText;
+                if (href) return `[${node.innerText}](${href})`;
+                break;
+            case 'h1': prefix = "# "; suffix = "\n\n"; break;
+            case 'h2': prefix = "## "; suffix = "\n\n"; break;
+            case 'h3': prefix = "### "; suffix = "\n\n"; break;
+            case 'li': prefix = "- "; suffix = "\n"; break;
+            case 'img':
+                const alt = node.getAttribute('alt') || 'Image';
+                const src = node.getAttribute('src') || '';
+                return `![${alt}](${src})`;
+            // Special handling for ChatGPT citations
+            case 'cite':
+                return `[${node.innerText}]`;
+        }
+
+        let content = "";
+        for (const child of node.childNodes) {
+            content += reconstructMarkdown(child);
+        }
+        return prefix + content + suffix;
+    };
+
     if (!element) {
-        // Broaden search to ensure we get the latest assistant message specifically
-        const assistantMessages = document.querySelectorAll('[data-message-author-role="assistant"]');
-        if (assistantMessages.length > 0) {
-            // Pick the latest one
-            const lastAssistantMessage = assistantMessages[assistantMessages.length - 1];
-            // Look for the markdown container inside it
-            element = lastAssistantMessage.querySelector('div.markdown') || lastAssistantMessage;
+        if (this._currentExpectedIndex !== null && this._currentExpectedIndex !== undefined) {
+            const assistantMessages = document.querySelectorAll('[data-message-author-role="assistant"]');
+            if (assistantMessages.length <= this._currentExpectedIndex) {
+                // The new response has not been created yet!
+                return { text: null, isStillGenerating: true };
+            }
+            element = assistantMessages[this._currentExpectedIndex];
+            console.log(`[${this.name}] Found turn-scoped assistant element at index ${this._currentExpectedIndex}`);
+        } else {
+            // Broaden search to ensure we get the latest assistant message specifically
+            const assistantMessages = document.querySelectorAll('[data-message-author-role="assistant"]');
+            if (assistantMessages.length > 0) {
+                element = assistantMessages[assistantMessages.length - 1];
+            }
+        }
+
+        if (element) {
+            // Capture all markdown/prose blocks within this specific message
+            const blocks = element.querySelectorAll('.markdown, .prose');
+            if (blocks.length > 0) {
+                // Map reconstructMarkdown across each true block Element and join them with double newlines
+                const text = Array.from(blocks)
+                    .map(block => reconstructMarkdown(block).trim())
+                    .filter(Boolean)
+                    .join("\n\n");
+                
+                const isStillGenerating = this._isResponseStillGeneratingDOM();
+                if (text && text.trim() !== "" && text.trim() !== this.lastSentMessage.trim()) {
+                    return {
+                        text: this.formatOutput("", text),
+                        isStillGenerating: isStillGenerating
+                    };
+                }
+                return { text: null, isStillGenerating: isStillGenerating };
+            }
         } else {
             // Fallback to general response selectors
             const elements = document.querySelectorAll(this.responseSelector);
-            if (elements.length > 0) {
-                element = elements[elements.length - 1];
+            if (elements.length === 0) {
+                return { text: null, isStillGenerating: this._isResponseStillGeneratingDOM() };
+            }
+            element = elements[elements.length - 1];
+        }
+    }
+
+    let responseText = reconstructMarkdown(element).trim();
+
+    // FALLBACK: If innerText is empty, look for images or widgets with labels/alt text
+    if (responseText.trim() === "" && element.querySelectorAll) {
+        const images = element.querySelectorAll('img[alt], [aria-label]');
+        if (images.length > 0) {
+            const labels = Array.from(images).map(el => el.getAttribute('alt') || el.getAttribute('aria-label')).filter(Boolean);
+            if (labels.length > 0) {
+                responseText = `[${labels.join(', ')}]`;
             }
         }
     }
-    if (!element) {
-        return { text: null, isStillGenerating: false };
-    }
 
-    let responseText = element.innerText || element.textContent || "";
-
-    // CLEANUP: Strip ChatGPT UI noise
+    // CLEANUP: Strip ChatGPT UI noise and internal citation markers
+    responseText = responseText.replace(/cite[^]*/g, ''); 
+    responseText = responseText.replace(/[^]*/g, '');
     responseText = this._cleanResponse(responseText);
 
     // Log for debugging mismatch
@@ -769,45 +853,62 @@ class ChatGptProvider {
     return { text: null, isStillGenerating: isStillGenerating };
   }
 
-  // Helper to strip ChatGPT's UI-specific labels and boilerplate
   _cleanResponse(text) {
-      if (!text) return "";
-      
-      let cleaned = text;
-
-      // 1. Remove footers/disclaimers
-      const footers = [
-          /ChatGPT can make mistakes\. Check important info\./gi,
-          /ChatGPT can make mistakes\. Consider checking important information\./gi,
-          /ChatGPT\s*v[\d.]+\s*/gi
-      ];
-
-      footers.forEach(regex => {
-          cleaned = cleaned.replace(regex, "");
-      });
-
-      return cleaned.trim();
+    if (!text) return "";
+    // Removed brittle regex hacks. 
+    // Debugger stream and precise DOM selectors handle noise avoidance.
+    return text.trim();
   }
 
   _isResponseStillGeneratingDOM() {
-    // If the send button is visible and NOT disabled, we are definitely NOT generating.
+    // Primary indicator: if the STOP button is visible, we are generating.
+    if (document.querySelector('[data-testid="stop-button"]')) {
+        return true;
+    }
+
+    // Secondary indicator: if the SEND button is disabled, we are generating.
     const sendButton = document.querySelector(this.sendButtonSelector);
     if (sendButton) {
         const isDisabled = sendButton.disabled || 
                            sendButton.getAttribute('aria-disabled') === 'true' ||
                            sendButton.classList.contains('disabled');
-        if (!isDisabled) {
-            return false; // Send button is ready, so we must be done.
-        }
+        if (isDisabled) return true;
     }
 
+    // Fallback indicator: looking for spinners or typing indicators
     if (this.thinkingIndicatorSelector && document.querySelector(this.thinkingIndicatorSelector)) {
         return true;
     }
-    if (this.thinkingIndicatorSelectorForDOM && document.querySelector(this.thinkingIndicatorSelectorForDOM)) {
-        return true;
-    }
+
     return false; 
+  }
+
+  async _finalizeResponse(requestId) {
+    this._stopDOMMonitoring(); // Stop any background polling
+    
+    const callback = this.pendingResponseCallbacks.get(requestId);
+    if (!callback) return;
+
+    console.log(`[${this.name}] _finalizeResponse for ${requestId}. Attempting high-fidelity capture...`);
+
+    // Try Copy button first
+    let finalContent = await this._captureFromCopyButton();
+    
+    if (!finalContent) {
+        console.log(`[${this.name}] Copy button capture failed. Falling back to DOM.`);
+        const result = this._captureResponseDOM();
+        finalContent = result.text;
+    }
+
+    const cleanedText = this._cleanResponse(finalContent || "");
+    if (cleanedText.trim() === "") {
+        callback(requestId, "[Empty response captured - possibly an image or widget without text]", true);
+    } else {
+        callback(requestId, cleanedText, true);
+    }
+
+    this.pendingResponseCallbacks.delete(requestId);
+    this.requestAccumulators.delete(requestId);
   }
 
   async _startDOMMonitoring(requestId) {
@@ -818,10 +919,10 @@ class ChatGptProvider {
     let noChangeStreak = 0;
     let checkCount = 0;
     
-    // Warm-up delay
-    await new Promise(resolve => setTimeout(resolve, 1500));
+    // Warm-up delay - reduced to be more responsive to fast models
+    await new Promise(resolve => setTimeout(resolve, 500));
 
-    const monitor = () => {
+    const monitor = async () => {
         const callback = this.pendingResponseCallbacks.get(requestId);
         if (!callback) {
             this._stopDOMMonitoring();
@@ -838,30 +939,126 @@ class ChatGptProvider {
         if (currentText && currentText !== lastCapturedText) {
             lastCapturedText = currentText;
             noChangeStreak = 0;
-            callback(requestId, currentText, false);
+            // DISABLED: No intermediate streaming for DOM capture
+            // callback(requestId, currentText, false);
         } else if (currentText === lastCapturedText) {
             noChangeStreak++;
         }
 
-        // Stability check: require longer streak for short text
-        const requiredStreak = lastCapturedText.length < 50 ? 10 : 5;
-        if (!isGenerating && noChangeStreak >= requiredStreak && lastCapturedText.trim() !== "") {
+        // ChatGPT finish conditions
+        if (!isGenerating && noChangeStreak >= 2 && lastCapturedText.length > 0) {
             isFinalDOMResponse = true;
         }
 
-        // Safety timeout
-        if (checkCount > 120) isFinalDOMResponse = true;
+        // STABLE-TEXT FALLBACK: If text is unchanged for 1.0s (4 checks) and non-empty, finalize instantly
+        if (noChangeStreak >= 4 && lastCapturedText.length > 0) {
+            isFinalDOMResponse = true;
+        }
+        
+        if (checkCount > 240) isFinalDOMResponse = true; // Adjusted count for 250ms intervals (60 seconds max)
 
         if (isFinalDOMResponse) {
-            console.log(`[${this.name}] DOM monitoring finished for ${requestId}. Final length: ${lastCapturedText.length}`);
-            callback(requestId, lastCapturedText, true);
+            console.log(`[${this.name}] DOM monitoring finishing for ${requestId}. Finalizing...`);
+
+            // OPTIMIZATION: Try to get perfect text from Copy button
+            const perfectText = await this._captureFromCopyButton();
+            if (perfectText) {
+                console.log(`[${this.name}] Successfully captured perfect text from clipboard.`);
+                lastCapturedText = perfectText;
+            }
+
+            const cleanedText = this._cleanResponse(lastCapturedText || "");
+            if (cleanedText.trim() === "") {
+                callback(requestId, "[Empty response captured - possibly an image or widget without text]", true);
+            } else {
+                callback(requestId, cleanedText, true);
+            }
             this.pendingResponseCallbacks.delete(requestId);
             this._stopDOMMonitoring();
         } else {
-            this.domMonitorTimer = setTimeout(monitor, 500);
+            this.domMonitorTimer = setTimeout(monitor, 250);
         }
     };
     monitor();
+  }
+
+  async _captureFromCopyButton() {
+    console.log(`[${this.name}] Attempting to capture from Copy button via event interception...`);
+    return new Promise(async (resolve) => {
+        let capturedText = null;
+        
+        // Listener to intercept the copy event
+        const onCopy = (e) => {
+            const text = e.clipboardData.getData('text/plain');
+            if (text && text.trim().length > 0) {
+                console.log(`[${this.name}] Successfully intercepted copy event! Text length: ${text.length}`);
+                capturedText = text.trim();
+
+                // Block the copy from hitting the system clipboard and stop UI popups
+                e.preventDefault();
+                e.stopImmediatePropagation();
+            }
+        };
+
+        // Clear previous interception
+        this._lastInterceptedClipboardText = null;
+
+        try {
+            document.addEventListener('copy', onCopy, true);
+
+             // STABILITY WAIT: Wait a brief moment for any citations to resolve
+             await new Promise(resolve => setTimeout(resolve, 200));
+
+            // Deep Search Helper
+            const findDeep = (root, selector) => {
+                const direct = Array.from(root.querySelectorAll(selector));
+                if (direct.length > 0) return direct;
+                return [];
+            };
+
+            // Find the copy buttons - target the last one specifically
+            const copyButtons = findDeep(document, 'button[data-testid="copy-turn-action-button"], button[data-testid="copy-button"], button[aria-label*="Copy" i], .copy-button button, [class*="copy"] button');
+            if (copyButtons.length === 0) {
+                console.log(`[${this.name}] No copy buttons found via deep search.`);
+                document.removeEventListener('copy', onCopy, true);
+                return resolve(null);
+            }
+
+            const lastButton = copyButtons[copyButtons.length - 1];
+            lastButton.scrollIntoView({ block: 'center' });
+            
+            // Trigger hover state to reveal any lazy UI
+            lastButton.dispatchEvent(new MouseEvent('mouseover', { bubbles: true }));
+            await new Promise(resolve => setTimeout(resolve, 300));
+
+            // Programmatic click
+            lastButton.click();
+            
+            // Wait up to 1s for the event (via onCopy OR via Relay Proxy)
+            let waitTime = 0;
+            const checkInterval = 50;
+            const maxWait = 1500;
+            
+            const waitLoop = setInterval(() => {
+                waitTime += checkInterval;
+                const foundText = capturedText || this._lastInterceptedClipboardText;
+                if (foundText || waitTime >= maxWait) {
+                    clearInterval(waitLoop);
+                    document.removeEventListener('copy', onCopy, true);
+                    resolve(foundText || null);
+                }
+            }, checkInterval);
+
+        } catch (err) {
+            console.error(`[${this.name}] Error in copy interception:`, err);
+            document.removeEventListener('copy', onCopy, true);
+            resolve(null);
+        }
+    });
+  }
+
+  async _readClipboard() {
+    return null; // Redirect to interception
   }
 
   _stopDOMMonitoring() {

@@ -21,19 +21,63 @@
 const CS_LOG_PREFIX = '[CS CONTENT]';
 console.log(CS_LOG_PREFIX, "Content Script Injected & Loaded");
 
+// Preserve original console functions to prevent recursion in remote logging
+const originalLog = console.log;
+const originalWarn = console.warn;
+const originalError = console.error;
+
+// Safe wrapper for chrome.runtime.sendMessage to prevent crash on invalidated context
+function safeSendMessage(message, callback) {
+    if (typeof chrome !== 'undefined' && chrome.runtime && chrome.runtime.sendMessage) {
+        try {
+            chrome.runtime.sendMessage(message, response => {
+                if (chrome.runtime.lastError) {
+                    originalWarn(CS_LOG_PREFIX, 'safeSendMessage runtime.lastError:', chrome.runtime.lastError.message);
+                } else if (callback) {
+                    callback(response);
+                }
+            });
+        } catch (e) {
+            originalWarn(CS_LOG_PREFIX, 'safeSendMessage failed (context likely invalidated):', e.message);
+        }
+    } else {
+        originalWarn(CS_LOG_PREFIX, 'safeSendMessage failed: chrome.runtime.sendMessage is undefined (stale context).');
+    }
+}
+
+
 // Helper to send logs to background script for remote logging
 function logRemote(level, message, requestId = null) {
-    chrome.runtime.sendMessage({
+    safeSendMessage({
         type: "LOG_MESSAGE",
         level: level,
-        message: `${CS_LOG_PREFIX} ${message}`,
+        message: message, // CS_LOG_PREFIX is already prepended by the console wrapper or caller
         requestId: requestId || currentRequestId
     });
-    // Also log locally
-    if (level === 'error') console.error(CS_LOG_PREFIX, message);
-    else if (level === 'warn') console.warn(CS_LOG_PREFIX, message);
-    else console.log(CS_LOG_PREFIX, message);
+    // Also log locally using original functions to avoid infinite recursion
+    if (level === 'error') originalError(CS_LOG_PREFIX, message);
+    else if (level === 'warn') originalWarn(CS_LOG_PREFIX, message);
+    else originalLog(CS_LOG_PREFIX, message);
 }
+
+// Monkey patch console functions to automatically route all logs to the background script & relay server
+console.log = (...args) => {
+    const msg = args.map(arg => typeof arg === 'object' ? JSON.stringify(arg) : String(arg)).join(' ');
+    originalLog.apply(console, args);
+    logRemote('info', msg);
+};
+
+console.warn = (...args) => {
+    const msg = args.map(arg => typeof arg === 'object' ? JSON.stringify(arg) : String(arg)).join(' ');
+    originalWarn.apply(console, args);
+    logRemote('warn', msg);
+};
+
+console.error = (...args) => {
+    const msg = args.map(arg => typeof arg === 'object' ? JSON.stringify(arg) : String(arg)).join(' ');
+    originalError.apply(console, args);
+    logRemote('error', msg);
+};
 
 // Global state
 let provider = null; // This will be set by initializeContentRelay
@@ -117,16 +161,12 @@ function initializeContentRelay() {
                 console.log(CS_LOG_PREFIX, 'Retrieved patterns from provider:', patternsFromProvider);
 
                 if (patternsFromProvider && patternsFromProvider.length > 0) {
-                    chrome.runtime.sendMessage({
+                    safeSendMessage({
                         type: "SET_DEBUGGER_TARGETS",
                         providerName: provider.name,
                         patterns: patternsFromProvider
                     }, response => {
-                        if (chrome.runtime.lastError) {
-                            console.error(CS_LOG_PREFIX, 'Error sending SET_DEBUGGER_TARGETS:', chrome.runtime.lastError.message);
-                        } else {
-                            console.log(CS_LOG_PREFIX, 'SET_DEBUGGER_TARGETS message sent, response:', response);
-                        }
+                        console.log(CS_LOG_PREFIX, 'SET_DEBUGGER_TARGETS message sent, response:', response);
                     });
                 } else {
                     console.log(CS_LOG_PREFIX, 'No patterns returned by provider or patterns array is empty.');
@@ -150,15 +190,11 @@ function initializeContentRelay() {
     }
 
     // Send CHAT_RELAY_READY (always, after attempting provider setup)
-    chrome.runtime.sendMessage({
+    safeSendMessage({
       type: "CHAT_RELAY_READY",
       chatInterface: provider ? provider.name : "unknown" // Add provider name
     }, response => {
-        if (chrome.runtime.lastError) {
-            console.error(CS_LOG_PREFIX, 'Error sending CHAT_RELAY_READY:', chrome.runtime.lastError.message);
-        } else {
-            console.log(CS_LOG_PREFIX, 'CHAT_RELAY_READY message sent, response:', response);
-        }
+        console.log(CS_LOG_PREFIX, 'CHAT_RELAY_READY message sent, response:', response);
     });
     
     // Setup message listeners (will be called later, once, via setupMessageListeners)
@@ -299,17 +335,13 @@ function startMonitoringForResponse() {
       console.error(CS_LOG_PREFIX, "Maximum response capture attempts reached. Stopping monitoring.");
       // Send a timeout/error message back to the background script
       if (currentRequestId !== null) { // Ensure there's a request ID to report error for
-          chrome.runtime.sendMessage({
+          safeSendMessage({
               type: "FINAL_RESPONSE_TO_RELAY",
               requestId: currentRequestId,
               error: "Response capture timed out in content script.",
               isFinal: true // Treat as final to unblock server
           }, response => {
-              if (chrome.runtime.lastError) {
-                  console.error(CS_LOG_PREFIX, 'Error sending capture timeout error:', chrome.runtime.lastError.message);
-              } else {
-                  console.log(CS_LOG_PREFIX, 'Capture timeout error sent to background, response:', response);
-              }
+              console.log(CS_LOG_PREFIX, 'Capture timeout error sent to background, response:', response);
           });
       }
       processingMessage = false;
@@ -343,17 +375,13 @@ function startMonitoringForResponse() {
       console.log(CS_LOG_PREFIX, `Captured response text (length: ${responseText.length}), isFinal: ${isFinal}`);
       
       // Send to background
-      chrome.runtime.sendMessage({
+      safeSendMessage({
         type: "FINAL_RESPONSE_TO_RELAY", // Or a new type like "PARTIAL_RESPONSE" if needed
         requestId: currentRequestId,
         text: responseText,
         isFinal: isFinal
       }, response => {
-          if (chrome.runtime.lastError) {
-              console.error(CS_LOG_PREFIX, 'Error sending response data to background:', chrome.runtime.lastError.message);
-          } else {
-              console.log(CS_LOG_PREFIX, 'Response data sent to background, response:', response);
-          }
+          console.log(CS_LOG_PREFIX, 'Response data sent to background, response:', response);
       });
 
       if (isFinal) {
@@ -687,16 +715,12 @@ function setupMessageListeners() { // Renamed from setupAutomaticMessageSending
         // Optionally, dispatch 'input' or 'change' events if the website needs them for reactivity
         // inputField.dispatchEvent(new Event('input', { bubbles: true, cancelable: true }));
 
-        chrome.runtime.sendMessage({
+        safeSendMessage({
           type: "DUPLICATE_MESSAGE_HANDLED",
           requestId: message.requestId,
           originalText: messageContent // The text that was duplicated
         }, response => {
-          if (chrome.runtime.lastError) {
-            console.error(CS_LOG_PREFIX, 'Error sending DUPLICATE_MESSAGE_HANDLED:', chrome.runtime.lastError.message);
-          } else {
-            console.log(CS_LOG_PREFIX, 'DUPLICATE_MESSAGE_HANDLED sent to background, response:', response);
-          }
+          console.log(CS_LOG_PREFIX, 'DUPLICATE_MESSAGE_HANDLED sent to background, response:', response);
         });
 
         // This request is now considered "handled" by the content script (as a duplicate).
@@ -870,12 +894,8 @@ function handleProviderResponse(requestId, responseText, isFinal) {
 
       console.log(CS_LOG_PREFIX, `[REQ-${requestId}] PRE-SEND to BG: Type: ${messageToSendToBackground.type}, isFinal: ${messageToSendToBackground.isFinal}, HasError: ${!!messageToSendToBackground.error}, TextLength: ${messageToSendToBackground.text ? String(messageToSendToBackground.text).length : (messageToSendToBackground.error ? String(messageToSendToBackground.error).length : 'N/A')}`);
       try {
-          chrome.runtime.sendMessage(messageToSendToBackground, response => {
-              if (chrome.runtime.lastError) {
-                  console.error(CS_LOG_PREFIX, `[REQ-${requestId}] SEND FAILED to BG: ${chrome.runtime.lastError.message}. Message attempted:`, JSON.stringify(messageToSendToBackground).substring(0, 500));
-              } else {
-                  console.log(CS_LOG_PREFIX, `[REQ-${requestId}] SEND SUCCESS to BG. Ack from BG:`, response);
-              }
+          safeSendMessage(messageToSendToBackground, response => {
+              console.log(CS_LOG_PREFIX, `[REQ-${requestId}] SEND SUCCESS to BG. Ack from BG:`, response);
           });
       } catch (syncError) {
           console.error(CS_LOG_PREFIX, `[REQ-${requestId}] SYNC ERROR sending to BG: ${syncError.message}. Message attempted:`, JSON.stringify(messageToSendToBackground).substring(0, 500), syncError);
@@ -941,16 +961,12 @@ function attemptInitialization() {
         console.log(CS_LOG_PREFIX, "Initialization attempt complete. Message listeners set up.");
         
         // Send a test message to background to confirm connection
-        chrome.runtime.sendMessage({
+        safeSendMessage({
             type: "CONTENT_SCRIPT_LOADED",
             url: window.location.href,
             hostname: window.location.hostname
         }, response => {
-            if (chrome.runtime.lastError) {
-                console.error(CS_LOG_PREFIX, 'Error sending CONTENT_SCRIPT_LOADED:', chrome.runtime.lastError.message);
-            } else {
-                console.log(CS_LOG_PREFIX, 'CONTENT_SCRIPT_LOADED sent successfully, response:', response);
-            }
+            console.log(CS_LOG_PREFIX, 'CONTENT_SCRIPT_LOADED sent successfully, response:', response);
         });
         
     } catch (error) {

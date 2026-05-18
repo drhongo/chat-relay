@@ -61,8 +61,19 @@ class ClaudeProvider {
     this.domFallbackTimer = null;
     this.domMonitorTimer = null;
 
+    this._lastInterceptedClipboardText = null;
+    this._injectClipboardProxy();
     this._loadSettings();
     console.log(`[${this.name}] Provider initialized.`);
+  }
+
+  _injectClipboardProxy() {
+      window.addEventListener('message', (e) => {
+          if (e.data && e.data.type === 'RELAY_CLIPBOARD_CAPTURE') {
+              this._lastInterceptedClipboardText = e.data.detail;
+              console.log(`[${this.name}] Received intercepted text from proxy message event.`);
+          }
+      });
   }
 
   _loadSettings() {
@@ -79,39 +90,39 @@ class ClaudeProvider {
 
     // Robust check for New Chat request
     if (typeof messageOrId === 'object' && messageOrId.settings && messageOrId.settings.new_chat) {
-        const currentPath = window.location.pathname;
-        const isOnFreshPage = currentPath === '/new' || currentPath === '/' || currentPath === '';
-        const hasNoMessages = document.querySelectorAll('[data-testid="user-message"]').length === 0;
+      const currentPath = window.location.pathname;
+      const isOnFreshPage = currentPath === '/new' || currentPath === '/' || currentPath === '';
+      const hasNoMessages = document.querySelectorAll('[data-testid="user-message"]').length === 0;
 
-        if (isOnFreshPage && hasNoMessages) {
-            // Already on a fresh chat with no messages — skip navigation
-            console.log(`[${this.name}] New Chat requested but already on fresh empty page. Skipping.`);
+      if (isOnFreshPage && hasNoMessages) {
+        // Already on a fresh chat with no messages — skip navigation
+        console.log(`[${this.name}] New Chat requested but already on fresh empty page. Skipping.`);
+      } else {
+        // On an existing conversation or fresh page that already has messages — start a new chat
+        console.log(`[${this.name}] New Chat requested. Current path: ${currentPath}. Attempting to navigate.`);
+        const newChatButtons = this._findDeep(document, this.newChatSelector);
+        if (newChatButtons.length > 0) {
+          const newChatButton = newChatButtons[0];
+          console.log(`[${this.name}] Found New Chat button, clicking...`);
+          const rect = newChatButton.getBoundingClientRect();
+          const clientX = rect.left + rect.width / 2;
+          const clientY = rect.top + rect.height / 2;
+
+          newChatButton.dispatchEvent(new PointerEvent('pointerdown', { bubbles: true, pointerType: 'mouse', clientX, clientY }));
+          newChatButton.dispatchEvent(new MouseEvent('mousedown', { bubbles: true, clientX, clientY }));
+          newChatButton.focus();
+          newChatButton.dispatchEvent(new PointerEvent('pointerup', { bubbles: true, pointerType: 'mouse', clientX, clientY }));
+          newChatButton.dispatchEvent(new MouseEvent('mouseup', { bubbles: true, clientX, clientY }));
+          newChatButton.click();
+
+          await new Promise(resolve => setTimeout(resolve, 3000));
         } else {
-            // On an existing conversation or fresh page that already has messages — start a new chat
-            console.log(`[${this.name}] New Chat requested. Current path: ${currentPath}. Attempting to navigate.`);
-            const newChatButtons = this._findDeep(document, this.newChatSelector);
-            if (newChatButtons.length > 0) {
-                const newChatButton = newChatButtons[0];
-                console.log(`[${this.name}] Found New Chat button, clicking...`);
-                const rect = newChatButton.getBoundingClientRect();
-                const clientX = rect.left + rect.width / 2;
-                const clientY = rect.top + rect.height / 2;
-
-                newChatButton.dispatchEvent(new PointerEvent('pointerdown', { bubbles: true, pointerType: 'mouse', clientX, clientY }));
-                newChatButton.dispatchEvent(new MouseEvent('mousedown', { bubbles: true, clientX, clientY }));
-                newChatButton.focus();
-                newChatButton.dispatchEvent(new PointerEvent('pointerup', { bubbles: true, pointerType: 'mouse', clientX, clientY }));
-                newChatButton.dispatchEvent(new MouseEvent('mouseup', { bubbles: true, clientX, clientY }));
-                newChatButton.click();
-
-                await new Promise(resolve => setTimeout(resolve, 3000));
-            } else {
-                // Fallback: navigate directly to /new
-                console.log(`[${this.name}] New Chat button not found, navigating to /new...`);
-                window.location.href = "https://claude.ai/new";
-                await new Promise(resolve => setTimeout(resolve, 5000));
-            }
+          // Fallback: navigate directly to /new
+          console.log(`[${this.name}] New Chat button not found, navigating to /new...`);
+          window.location.href = "https://claude.ai/new";
+          await new Promise(resolve => setTimeout(resolve, 5000));
         }
+      }
     }
 
     // 1. Polling for Input Field using shadow-piercing search
@@ -120,14 +131,14 @@ class ClaudeProvider {
     const maxPollAttempts = 15;
 
     while (pollAttempts < maxPollAttempts) {
-        const inputFields = this._findDeep(document, this.inputSelector);
-        if (inputFields.length > 0) {
-            inputField = inputFields[0];
-            console.log(`[${this.name}] Input field found after ${pollAttempts + 1} attempts.`);
-            break;
-        }
-        await new Promise(resolve => setTimeout(resolve, 1000));
-        pollAttempts++;
+      const inputFields = this._findDeep(document, this.inputSelector);
+      if (inputFields.length > 0) {
+        inputField = inputFields[0];
+        console.log(`[${this.name}] Input field found after ${pollAttempts + 1} attempts.`);
+        break;
+      }
+      await new Promise(resolve => setTimeout(resolve, 1000));
+      pollAttempts++;
     }
 
     if (!inputField) {
@@ -138,6 +149,15 @@ class ClaudeProvider {
 
     try {
       this.lastSentMessage = ""; // Will be set below
+
+      let expectedIndex = 0;
+      const isNewChat = typeof messageOrId === 'object' && messageOrId.settings && messageOrId.settings.new_chat;
+      if (!isNewChat) {
+          const existingHosts = this._findDeep(document, '[data-testid="assistant-message"], .font-claude-response-body');
+          expectedIndex = existingHosts.length;
+      }
+      this._currentExpectedIndex = expectedIndex;
+      console.log(`[${this.name}] Calculated expectedIndex: ${expectedIndex}`);
 
       let textToInput = "";
       let blobToPaste = null;
@@ -178,55 +198,55 @@ class ClaudeProvider {
 
         // Method 1: Clipboard paste — most reliable for Tiptap
         try {
-            const dt = new DataTransfer();
-            dt.setData('text/plain', textToInput);
-            inputField.dispatchEvent(new ClipboardEvent('paste', { clipboardData: dt, bubbles: true, cancelable: true }));
-            await new Promise(resolve => setTimeout(resolve, 200));
-            const afterPaste = (inputField.innerText || inputField.textContent || "").trim();
-            if (afterPaste.length > 0) {
-                insertSucceeded = true;
-                console.log(`[${this.name}] Text inserted via paste. Content: "${afterPaste.substring(0, 60)}"`);
-            }
+          const dt = new DataTransfer();
+          dt.setData('text/plain', textToInput);
+          inputField.dispatchEvent(new ClipboardEvent('paste', { clipboardData: dt, bubbles: true, cancelable: true }));
+          await new Promise(resolve => setTimeout(resolve, 200));
+          const afterPaste = (inputField.innerText || inputField.textContent || "").trim();
+          if (afterPaste.length > 0) {
+            insertSucceeded = true;
+            console.log(`[${this.name}] Text inserted via paste. Content: "${afterPaste.substring(0, 60)}"`);
+          }
         } catch (e) {
-            console.warn(`[${this.name}] Paste failed: ${e.message}`);
+          console.warn(`[${this.name}] Paste failed: ${e.message}`);
         }
 
         // Method 2: execCommand insertText
         if (!insertSucceeded) {
-            try {
-                document.execCommand('selectAll', false, null);
-                document.execCommand('delete', false, null);
-                document.execCommand('insertText', false, textToInput);
-                await new Promise(resolve => setTimeout(resolve, 200));
-                if ((inputField.innerText || "").trim().length > 0) {
-                    insertSucceeded = true;
-                    console.log(`[${this.name}] Text inserted via execCommand.`);
-                }
-            } catch (e) {
-                console.warn(`[${this.name}] execCommand failed: ${e.message}`);
+          try {
+            document.execCommand('selectAll', false, null);
+            document.execCommand('delete', false, null);
+            document.execCommand('insertText', false, textToInput);
+            await new Promise(resolve => setTimeout(resolve, 200));
+            if ((inputField.innerText || "").trim().length > 0) {
+              insertSucceeded = true;
+              console.log(`[${this.name}] Text inserted via execCommand.`);
             }
+          } catch (e) {
+            console.warn(`[${this.name}] execCommand failed: ${e.message}`);
+          }
         }
 
         // Method 3: Simulate keyboard typing character by character (slow but reliable)
         if (!insertSucceeded) {
-            console.log(`[${this.name}] Trying keyboard simulation...`);
-            inputField.focus();
-            // Clear first
-            document.execCommand('selectAll', false, null);
-            document.execCommand('delete', false, null);
-            // Type character by character
-            for (const char of textToInput.substring(0, 500)) { // limit to 500 chars for perf
-                document.execCommand('insertText', false, char);
-            }
-            await new Promise(resolve => setTimeout(resolve, 100));
-            if ((inputField.innerText || "").trim().length > 0) {
-                insertSucceeded = true;
-                console.log(`[${this.name}] Text inserted via keyboard simulation.`);
-            }
+          console.log(`[${this.name}] Trying keyboard simulation...`);
+          inputField.focus();
+          // Clear first
+          document.execCommand('selectAll', false, null);
+          document.execCommand('delete', false, null);
+          // Type character by character
+          for (const char of textToInput.substring(0, 500)) { // limit to 500 chars for perf
+            document.execCommand('insertText', false, char);
+          }
+          await new Promise(resolve => setTimeout(resolve, 100));
+          if ((inputField.innerText || "").trim().length > 0) {
+            insertSucceeded = true;
+            console.log(`[${this.name}] Text inserted via keyboard simulation.`);
+          }
         }
 
         if (!insertSucceeded) {
-            console.error(`[${this.name}] All text insertion methods failed!`);
+          console.error(`[${this.name}] All text insertion methods failed!`);
         }
 
         // Trigger input event so Tiptap/React enables the send button
@@ -257,31 +277,31 @@ class ClaudeProvider {
 
         // Fallback: find nearest enabled button to the input field container
         if (sendButtons.length === 0) {
-            const inputContainer = inputField.closest('form, [class*="input"], [class*="composer"], [class*="footer"], fieldset') || inputField.parentElement;
-            if (inputContainer) {
-                const nearbyButtons = Array.from(inputContainer.querySelectorAll('button'));
-                const enabledNearby = nearbyButtons.filter(b =>
-                    !b.disabled &&
-                    b.getAttribute('aria-disabled') !== 'true' &&
-                    b.type !== 'button' || b.getAttribute('aria-label') // prefer labeled buttons
-                );
-                if (enabledNearby.length > 0) {
-                    sendButtons = enabledNearby;
-                }
+          const inputContainer = inputField.closest('form, [class*="input"], [class*="composer"], [class*="footer"], fieldset') || inputField.parentElement;
+          if (inputContainer) {
+            const nearbyButtons = Array.from(inputContainer.querySelectorAll('button'));
+            const enabledNearby = nearbyButtons.filter(b =>
+              !b.disabled &&
+              b.getAttribute('aria-disabled') !== 'true' &&
+              b.type !== 'button' || b.getAttribute('aria-label') // prefer labeled buttons
+            );
+            if (enabledNearby.length > 0) {
+              sendButtons = enabledNearby;
             }
+          }
         }
 
         if (sendButtons.length > 0) {
-            sendButton = sendButtons[sendButtons.length - 1];
-            const isDisabled = sendButton.disabled ||
-                               sendButton.getAttribute('aria-disabled') === 'true' ||
-                               sendButton.classList.contains('opacity-50') ||
-                               sendButton.classList.contains('pointer-events-none');
+          sendButton = sendButtons[sendButtons.length - 1];
+          const isDisabled = sendButton.disabled ||
+            sendButton.getAttribute('aria-disabled') === 'true' ||
+            sendButton.classList.contains('opacity-50') ||
+            sendButton.classList.contains('pointer-events-none');
 
-            if (!isDisabled) {
-                console.log(`[${this.name}] Enabled send button found. aria-label: "${sendButton.getAttribute('aria-label')}"`);
-                break;
-            }
+          if (!isDisabled) {
+            console.log(`[${this.name}] Enabled send button found. aria-label: "${sendButton.getAttribute('aria-label')}"`);
+            break;
+          }
         }
         console.log(`[${this.name}] Waiting for send button (attempt ${buttonPollAttempts + 1}). Found: ${sendButtons.length}`);
         // Re-dispatch input events to help UI update
@@ -304,9 +324,9 @@ class ClaudeProvider {
       const maxAttempts = 5;
       while (attempts < maxAttempts) {
         const isDisabled = sendButton.disabled ||
-                           sendButton.getAttribute('aria-disabled') === 'true' ||
-                           sendButton.classList.contains('opacity-50') ||
-                           sendButton.classList.contains('pointer-events-none');
+          sendButton.getAttribute('aria-disabled') === 'true' ||
+          sendButton.classList.contains('opacity-50') ||
+          sendButton.classList.contains('pointer-events-none');
 
         console.log(`[${this.name}] Send button check before click (attempt ${attempts + 1}). Disabled: ${isDisabled}`);
 
@@ -328,10 +348,10 @@ class ClaudeProvider {
 
           // Trigger Enter key as fallback after a short delay
           setTimeout(() => {
-              const enterOptions = { key: 'Enter', code: 'Enter', keyCode: 13, which: 13, bubbles: true, cancelable: true };
-              inputField.dispatchEvent(new KeyboardEvent('keydown', enterOptions));
-              inputField.dispatchEvent(new KeyboardEvent('keypress', enterOptions));
-              inputField.dispatchEvent(new KeyboardEvent('keyup', enterOptions));
+            const enterOptions = { key: 'Enter', code: 'Enter', keyCode: 13, which: 13, bubbles: true, cancelable: true };
+            inputField.dispatchEvent(new KeyboardEvent('keydown', enterOptions));
+            inputField.dispatchEvent(new KeyboardEvent('keypress', enterOptions));
+            inputField.dispatchEvent(new KeyboardEvent('keyup', enterOptions));
           }, 100);
 
           return true;
@@ -354,17 +374,46 @@ class ClaudeProvider {
   _reportSendError(requestId, errorMessage) {
     const callback = this.pendingResponseCallbacks.get(requestId);
     if (callback) {
-        callback(requestId, `[PROVIDER_SEND_ERROR: ${errorMessage}]`, true);
-        this.pendingResponseCallbacks.delete(requestId);
+      callback(requestId, `[PROVIDER_SEND_ERROR: ${errorMessage}]`, true);
+      this.pendingResponseCallbacks.delete(requestId);
     }
   }
 
   _findDeep(root, selector) {
-    const elements = Array.from(root.querySelectorAll(selector));
-    const shadowElements = Array.from(root.querySelectorAll('*'))
-        .filter(el => el.shadowRoot)
-        .flatMap(el => this._findDeep(el.shadowRoot, selector));
-    return [...elements, ...shadowElements];
+    const results = [];
+    const search = (node) => {
+      if (!node) return;
+      
+      // Match current node
+      if (node.matches && node.matches(selector)) {
+        results.push(node);
+      }
+      
+      // Also query direct descendants if matches isn't enough
+      if (node.querySelectorAll) {
+        const direct = node.querySelectorAll(selector);
+        for (const el of direct) {
+          if (!results.includes(el)) {
+            results.push(el);
+          }
+        }
+      }
+      
+      // Pierce Shadow Root if present
+      if (node.shadowRoot) {
+        search(node.shadowRoot);
+      }
+      
+      // Traverse standard children
+      let child = node.firstElementChild;
+      while (child) {
+        search(child);
+        child = child.nextElementSibling;
+      }
+    };
+    
+    search(root);
+    return results;
   }
 
   async initiateResponseCapture(requestId, responseCallback) {
@@ -378,9 +427,9 @@ class ClaudeProvider {
       const patterns = this.getStreamingApiPatterns();
       await new Promise(resolve => {
         chrome.runtime.sendMessage({
-            type: "SET_DEBUGGER_TARGETS",
-            providerName: this.name,
-            patterns: patterns
+          type: "SET_DEBUGGER_TARGETS",
+          providerName: this.name,
+          patterns: patterns
         }, () => resolve());
       });
 
@@ -395,10 +444,10 @@ class ClaudeProvider {
         }
       }, 3000); // 3s delay gives time for message send + UI response to start
     } else {
-      // DOM-only mode: wait 2s for send to complete and Claude to start responding
+      // DOM-only mode: wait 500ms for send to complete and Claude to start responding
       this.domFallbackTimer = setTimeout(() => {
         this._startDOMMonitoring(requestId);
-      }, 2000);
+      }, 500);
     }
   }
 
@@ -423,48 +472,48 @@ class ClaudeProvider {
     if (accumulator.isDefinitelyFinal) return;
 
     if (rawData && rawData.trim() !== "") {
-        const parseOutput = this.parseDebuggerResponse(rawData, requestId);
+      const parseOutput = this.parseDebuggerResponse(rawData, requestId);
 
-        if (accumulator.text.length === 0 && parseOutput.text) {
-          console.log(`[${this.name}] SUCCESS: First debugger data received for ${requestId}. Disabling DOM fallback timer.`);
-          if (this.domFallbackTimer) {
-              clearTimeout(this.domFallbackTimer);
-              this.domFallbackTimer = null;
-          }
+      if (accumulator.text.length === 0 && parseOutput.text) {
+        console.log(`[${this.name}] SUCCESS: First debugger data received for ${requestId}. Disabling DOM fallback timer.`);
+        if (this.domFallbackTimer) {
+          clearTimeout(this.domFallbackTimer);
+          this.domFallbackTimer = null;
         }
+      }
 
-        if (parseOutput.text) {
-            accumulator.text += parseOutput.text;
-        }
+      if (parseOutput.text) {
+        accumulator.text += parseOutput.text;
+      }
 
-        if (parseOutput.isFinalResponse) {
-            // Only finalize if we have text. If text is empty but it's "final",
-            // it might mean the debugger missed the data chunks but got the stop signal.
-            // In that case, we let DOM fallback handle it.
-            if (accumulator.text.length > 0) {
-                accumulator.isDefinitelyFinal = true;
-            } else {
-                console.log(`[${this.name}] Received final signal but text is empty. Waiting for potential more chunks or DOM fallback.`);
-            }
-        }
-
-        // Only callback if we have text or it's definitely final
-        if (accumulator.text.length > 0 || accumulator.isDefinitelyFinal) {
-            callback(requestId, accumulator.text, accumulator.isDefinitelyFinal);
-        }
-    } else if (isFinalFromBackground) {
-        console.log(`[${this.name}] Debugger signal: final from background for ${requestId}. Acc len: ${accumulator.text.length}`);
-
-        // If we have some text, we can finalize.
+      if (parseOutput.isFinalResponse) {
+        // Only finalize if we have text. If text is empty but it's "final",
+        // it might mean the debugger missed the data chunks but got the stop signal.
+        // In that case, we let DOM fallback handle it.
         if (accumulator.text.length > 0) {
-            accumulator.isDefinitelyFinal = true;
-            callback(requestId, accumulator.text, true);
+          accumulator.isDefinitelyFinal = true;
         } else {
-            // Debugger finished with NO text. This is a failure of the debugger method.
-            // We DO NOT mark as final here; instead, we let the DOM fallback timer
-            // (which was set in initiateResponseCapture) trigger _startDOMMonitoring.
-            console.log(`[${this.name}] Debugger finished with NO text. Relying on DOM fallback.`);
+          console.log(`[${this.name}] Received final signal but text is empty. Waiting for potential more chunks or DOM fallback.`);
         }
+      }
+
+      // Only callback if we have text or it's definitely final
+      if (accumulator.text.length > 0 || accumulator.isDefinitelyFinal) {
+        callback(requestId, accumulator.text, accumulator.isDefinitelyFinal);
+      }
+    } else if (isFinalFromBackground) {
+      console.log(`[${this.name}] Debugger signal: final from background for ${requestId}. Acc len: ${accumulator.text.length}`);
+
+      // If we have some text, we can finalize.
+      if (accumulator.text.length > 0) {
+        accumulator.isDefinitelyFinal = true;
+        callback(requestId, accumulator.text, true);
+      } else {
+        // Debugger finished with NO text. This is a failure of the debugger method.
+        // We DO NOT mark as final here; instead, we let the DOM fallback timer
+        // (which was set in initiateResponseCapture) trigger _startDOMMonitoring.
+        console.log(`[${this.name}] Debugger finished with NO text. Relying on DOM fallback.`);
+      }
     }
 
     if (accumulator.isDefinitelyFinal) {
@@ -480,177 +529,226 @@ class ClaudeProvider {
     // Check for non-SSE content
     const trimmed = sseChunk.trim();
     if (trimmed.startsWith('import ') || trimmed.startsWith('export ') || trimmed.startsWith('function(') || trimmed.length > 50000) { // Increased limit
-        return { text: "", isFinalResponse: false };
+      return { text: "", isFinalResponse: false };
     }
 
     const messages = sseChunk.split('\n\n');
     for (const msg of messages) {
-        if (!msg.trim()) continue;
+      if (!msg.trim()) continue;
 
-        let eventType = null;
-        let dataStr = null;
-        const lines = msg.split('\n');
+      let eventType = null;
+      let dataStr = null;
+      const lines = msg.split('\n');
 
-        for (const line of lines) {
-            if (line.startsWith("event:")) eventType = line.substring(6).trim();
-            else if (line.startsWith("data:")) dataStr = line.substring(5).trim();
-        }
+      for (const line of lines) {
+        if (line.startsWith("event:")) eventType = line.substring(6).trim();
+        else if (line.startsWith("data:")) dataStr = line.substring(5).trim();
+      }
 
-        if (eventType === "message_stop") {
+      if (eventType === "message_stop") {
+        isFinal = true;
+      } else if (eventType && dataStr) {
+        try {
+          const data = JSON.parse(dataStr);
+          if (eventType === "content_block_delta" && data.delta?.text) {
+            extractedText += data.delta.text;
+          } else if (eventType === "message_delta" && data.delta?.stop_reason) {
             isFinal = true;
-        } else if (eventType && dataStr) {
-            try {
-                const data = JSON.parse(dataStr);
-                if (eventType === "content_block_delta" && data.delta?.text) {
-                    extractedText += data.delta.text;
-                } else if (eventType === "message_delta" && data.delta?.stop_reason) {
-                    isFinal = true;
-                }
-            } catch (e) {
-                // Ignore parse errors for partial/malformed JSON in stream
-            }
+          }
+        } catch (e) {
+          // Ignore parse errors for partial/malformed JSON in stream
         }
+      }
     }
     return { text: extractedText, isFinalResponse: isFinal };
   }
 
   _captureResponseDOM(element = null) {
     if (!element) {
-        const sentTrimmed = this.lastSentMessage.trim();
-        // Use the LAST user-message element so that in multi-turn conversations
-        // we walk siblings from the most recent user turn, not the first one.
-        const allUserMsgEls = document.querySelectorAll('[data-testid="user-message"]');
-        const userMsgEl = allUserMsgEls.length > 0 ? allUserMsgEls[allUserMsgEls.length - 1] : null;
+      const sentTrimmed = this.lastSentMessage.trim();
 
-        if (userMsgEl) {
-            // Walk up from the user-message until we find an ancestor that has
-            // a SUBSEQUENT sibling containing substantial non-user text.
-            // The timestamp "12:00 PM" is a direct sibling at low levels — we need
-            // to go higher until the sibling is the full assistant turn.
-            let node = userMsgEl;
-            for (let depth = 0; depth < 15; depth++) {
-                const parent = node.parentElement;
-                if (!parent) break;
+      // Enforce expectedIndex scoping to prevent race conditions or cross-turn leaks
+      if (this._currentExpectedIndex !== null && this._currentExpectedIndex !== undefined) {
+          const hosts = this._findDeep(document, '[data-testid="assistant-message"], .font-claude-response-body');
+          if (hosts.length <= this._currentExpectedIndex) {
+              // The new response has not been created yet!
+              return { found: false, text: "", isStillGenerating: true };
+          }
+          const host = hosts[this._currentExpectedIndex];
+          const sub = host.querySelector('.font-claude-response-body, .standard-markdown, div.prose');
+          element = sub || host;
+          console.log(`[${this.name}] Found turn-scoped assistant element at index ${this._currentExpectedIndex}`);
+      }
 
-                // Check all next siblings of node at this level
-                let sib = node.nextElementSibling;
-                while (sib) {
-                    const sibText = (sib.innerText || sib.textContent || "").trim();
-                    const isTimestamp = /^(\d{1,2}:\d{2})\s?([APM]{2})?$/i.test(sibText);
-                    
-                    // Must be non-empty, not a timestamp, and not user message echo
-                    if (sibText.length > 0 && !isTimestamp && !sibText.startsWith(sentTrimmed)) {
-                        // Prioritize if it has a known response class
-                        const hasResponseClass = sib.querySelector('.font-claude-response-body, .standard-markdown') || 
-                                               sib.classList.contains('font-claude-response-body') ||
-                                               sib.classList.contains('standard-markdown');
-                        
-                        if (hasResponseClass || !element) {
-                            element = sib;
-                            console.log(`[${this.name}] Found assistant turn at depth ${depth}, text: "${sibText.substring(0, 80)}"`);
-                            if (hasResponseClass) break; // Found the high-quality match
-                        }
-                    }
-                    sib = sib.nextElementSibling;
-                }
-                if (element) break;
-                node = parent;
+      if (!element) {
+          const allUserMsgEls = document.querySelectorAll('[data-testid="user-message"]');
+          const userMsgEl = allUserMsgEls.length > 0 ? allUserMsgEls[allUserMsgEls.length - 1] : null;
+
+          if (userMsgEl) {
+        // Walk up from the user-message until we find an ancestor that has
+        // a SUBSEQUENT sibling containing substantial non-user text.
+        // The timestamp "12:00 PM" is a direct sibling at low levels — we need
+        // to go higher until the sibling is the full assistant turn.
+        let node = userMsgEl;
+        for (let depth = 0; depth < 10; depth++) {
+          const parent = node.parentElement;
+          if (!parent) break;
+
+          // Check all next siblings
+          let sib = node.nextElementSibling;
+          while (sib) {
+            const sibText = (sib.innerText || sib.textContent || "").trim();
+            const isTimestamp = /^(\d{1,2}:\d{2})\s?([APM]{2})?$/i.test(sibText);
+
+            // Skip timestamps and the user's own message
+            if (sibText.length > 0 && !isTimestamp && !sibText.startsWith(sentTrimmed)) {
+              const hasHighQualityClass = sib.querySelector('.font-claude-response-body, .standard-markdown') ||
+                sib.classList.contains('font-claude-response-body') ||
+                sib.classList.contains('standard-markdown');
+
+              // If we find a high-quality markdown container, it's definitely the winner
+              if (hasHighQualityClass) {
+                element = sib;
+                console.log(`[${this.name}] Found HIGH-QUALITY assistant turn at depth ${depth}.`);
+                break;
+              }
+
+              // Fallback to the first non-empty sibling if we haven't found a HQ one yet
+              if (!element && sibText.length > 20) {
+                element = sib;
+                console.log(`[${this.name}] Found potential assistant turn at depth ${depth}.`);
+              }
             }
+            sib = sib.nextElementSibling;
+          }
+          if (element && element.querySelector('.font-claude-response-body, .standard-markdown')) break;
+          node = parent;
         }
+      }
+      }
 
-        if (!element) {
-            // Last resort: find any element in the page that has the action-bar-copy/retry
-            // buttons as children — those only appear on completed messages
-            const retryBtns = Array.from(document.querySelectorAll('[data-testid="action-bar-retry"]'));
-            if (retryBtns.length > 0) {
-                // The retry button's grandparent or similar should be the assistant message
-                let candidate = retryBtns[retryBtns.length - 1];
-                for (let i = 0; i < 6; i++) {
-                    candidate = candidate.parentElement;
-                    if (!candidate) break;
-                    const t = (candidate.innerText || candidate.textContent || "").trim();
-                    const isTimestamp = /^(\d{1,2}:\d{2})\s?([APM]{2})?$/i.test(t);
-                    if (t.length > 0 && !isTimestamp && !t.startsWith(sentTrimmed)) {
-                        element = candidate;
-                        console.log(`[${this.name}] Found assistant turn via retry button ancestor. Text: "${t.substring(0, 80)}"`);
-                        break;
-                    }
-                }
+      if (!element) {
+        // Last resort: find any element in the page that has the action-bar-copy/retry
+        // buttons as children — those only appear on completed messages
+        const retryBtns = Array.from(document.querySelectorAll('[data-testid="action-bar-retry"]'));
+        if (retryBtns.length > 0) {
+          // The retry button's grandparent or similar should be the assistant message
+          let candidate = retryBtns[retryBtns.length - 1];
+          for (let i = 0; i < 6; i++) {
+            candidate = candidate.parentElement;
+            if (!candidate) break;
+            const t = (candidate.innerText || candidate.textContent || "").trim();
+            const isTimestamp = /^(\d{1,2}:\d{2})\s?([APM]{2})?$/i.test(t);
+            if (t.length > 0 && !isTimestamp && !t.startsWith(sentTrimmed)) {
+              element = candidate;
+              console.log(`[${this.name}] Found assistant turn via retry button ancestor. Text: "${t.substring(0, 80)}"`);
+              break;
             }
+          }
         }
+      }
 
-        if (!element) {
-            // Absolute last resort: just find the last element matching our primary response selectors
-            const candidates = this._findDeep(document, this.responseSelector);
-            if (candidates.length > 0) {
-                // Pick the last one that isn't the user message or a timestamp
-                for (let i = candidates.length - 1; i >= 0; i--) {
-                    const t = (candidates[i].innerText || candidates[i].textContent || "").trim();
-                    const isTimestamp = /^(\d{1,2}:\d{2})\s?([APM]{2})?$/i.test(t);
-                    if (t.length > 0 && !isTimestamp && !t.startsWith(sentTrimmed)) {
-                        element = candidates[i];
-                        console.log(`[${this.name}] Found assistant turn via primary selector fallback. Text: "${t.substring(0, 80)}"`);
-                        break;
-                    }
-                }
+      if (!element) {
+        // Absolute last resort: just find the last element matching our primary response selectors
+        const candidates = this._findDeep(document, this.responseSelector);
+        if (candidates.length > 0) {
+          // Pick the last one that isn't the user message or a timestamp
+          for (let i = candidates.length - 1; i >= 0; i--) {
+            const t = (candidates[i].innerText || candidates[i].textContent || "").trim();
+            const isTimestamp = /^(\d{1,2}:\d{2})\s?([APM]{2})?$/i.test(t);
+            if (t.length > 0 && !isTimestamp && !t.startsWith(sentTrimmed)) {
+              element = candidates[i];
+              console.log(`[${this.name}] Found assistant turn via primary selector fallback. Text: "${t.substring(0, 80)}"`);
+              break;
             }
+          }
         }
+      }
 
-        if (!element) {
-            return { found: false, text: '', isStillGenerating: this._isGenerating() };
-        }
+      if (!element) {
+        return { found: false, text: '', isStillGenerating: this._isGenerating() };
+      }
     }
 
-    // Clean up the captured text
-    const sentTrimmed = this.lastSentMessage.trim();
-    let text = (element.innerText || element.textContent || "").trim();
+    let responseText = this._htmlToMarkdown(element);
 
-    // CLEANUP: Strip Claude UI noise
-    text = this._cleanResponse(text);
+    // CLEANUP: Strip Claude's specific UI boilerplate
+    responseText = this._cleanResponse(responseText);
 
-    // Strip user message echo if it appears at the start
-    if (sentTrimmed && text.startsWith(sentTrimmed)) {
-        text = text.slice(sentTrimmed.length).trim();
+    if (this.lastSentMessage && responseText.trim().startsWith(this.lastSentMessage.trim())) {
+      const potentialActualResponse = responseText.substring(this.lastSentMessage.length).trim();
+      if (potentialActualResponse === "") {
+        return { found: false, text: null, isStillGenerating: this._isGenerating() };
+      }
+      responseText = potentialActualResponse;
     }
 
     const isStillGenerating = this._isGenerating();
-    if (text.length > 0) {
-        console.log(`[${this.name}] _captureResponseDOM: text length=${text.length}, generating=${isStillGenerating}, preview="${text.substring(0, 80)}"`);
+    if (responseText.length > 0) {
+      console.log(`[${this.name}] _captureResponseDOM: text length=${responseText.length}, generating=${isStillGenerating}, preview="${responseText.substring(0, 80)}"`);
     }
 
-    return { found: text.length > 0, text, isStillGenerating };
+    return { found: responseText.length > 0, text: responseText, isStillGenerating };
   }
 
-  // Helper to strip Claude's UI-specific labels and boilerplate
+  // Helper to convert rendered HTML back to basic Markdown
+  _htmlToMarkdown(element) {
+    if (!element) return "";
+
+    // Create a clone to avoid manipulating the live DOM
+    const clone = element.cloneNode(true);
+
+    // Helper to process nodes recursively
+    const process = (node) => {
+      if (node.nodeType === Node.TEXT_NODE) {
+        return node.textContent;
+      }
+
+      if (node.nodeType !== Node.ELEMENT_NODE) return "";
+
+      let prefix = "";
+      let suffix = "";
+      const tagName = node.tagName.toLowerCase();
+
+      switch (tagName) {
+        case 'p': suffix = "\n\n"; break;
+        case 'br': suffix = "\n"; break;
+        case 'strong': case 'b': prefix = "**"; suffix = "**"; break;
+        case 'em': case 'i': prefix = "*"; suffix = "*"; break;
+        case 'code':
+          if (node.parentElement && node.parentElement.tagName.toLowerCase() === 'pre') {
+            prefix = "```\n"; suffix = "\n```\n";
+          } else {
+            prefix = "`"; suffix = "`";
+          }
+          break;
+        case 'h1': prefix = "# "; suffix = "\n\n"; break;
+        case 'h2': prefix = "## "; suffix = "\n\n"; break;
+        case 'h3': prefix = "### "; suffix = "\n\n"; break;
+        case 'li': prefix = "- "; suffix = "\n"; break;
+        case 'ul': case 'ol': suffix = "\n"; break;
+        case 'blockquote': prefix = "> "; suffix = "\n\n"; break;
+      }
+
+      let content = "";
+      for (const child of node.childNodes) {
+        content += process(child);
+      }
+
+      return prefix + content + suffix;
+    };
+
+    return process(clone).trim()
+      .replace(/\n{3,}/g, '\n\n') // Normalize multiple newlines
+      .trim();
+  }
+
+  // Clean up the captured text
   _cleanResponse(text) {
-      if (!text) return "";
-      
-      let cleaned = text;
-
-      // 1. Strip known Claude UI prefix labels
-      cleaned = cleaned.replace(/^Claude responded:\s*/i, '').trim();
-      cleaned = cleaned.replace(/^Claude\s*\n/i, '').trim();
-      cleaned = cleaned.replace(/^(Haiku|Sonnet|Opus|Claude)\s[\d.]+\s*\n/i, '').trim();
-
-      // 2. Remove footers/disclaimers
-      const footers = [
-          /Claude is AI and can make mistakes\./gi,
-          /Please double-check responses\./gi,
-          /Check for accuracy\./gi,
-          /Subscribe to Pro for/gi,
-          /Claude [\d.]+ (Haiku|Sonnet|Opus)/gi
-      ];
-
-      footers.forEach(regex => {
-          cleaned = cleaned.replace(regex, "");
-      });
-
-      // 3. Deduplicate repeated paragraphs
-      const paras = cleaned.split('\n\n');
-      const deduped = paras.filter((para, i) => i === 0 || para.trim() !== paras[i - 1].trim());
-      cleaned = deduped.join('\n\n').trim();
-
-      return cleaned.trim();
+    if (!text) return "";
+    // We've removed the brittle regex hacks. 
+    // Surgical DOM selection in _captureResponseDOM now handles disclaimer avoidance.
+    return text.trim();
   }
 
   _isGenerating() {
@@ -662,18 +760,18 @@ class ClaudeProvider {
 
     // Secondary check: look for streaming cursor or animation
     const streamingIndicators = document.querySelectorAll(
-        '.streaming-cursor, [class*="cursor-blink"], [class*="streaming"], .loading-dots'
+      '.streaming-cursor, [class*="cursor-blink"], [class*="streaming"], .loading-dots'
     );
     return streamingIndicators.length > 0;
   }
 
   getStreamingApiPatterns() {
     return [
-        { urlPattern: this.debuggerUrlPattern, requestStage: "Response" },
-        { urlPattern: "*://claude.ai/api/organizations/*/conversations/*/completion*", requestStage: "Response" },
-        { urlPattern: "*/api/*/conversations/*/completion*", requestStage: "Response" },
-        { urlPattern: "*completion*", requestStage: "Response" },
-        { urlPattern: "*conversations*", requestStage: "Response" }
+      { urlPattern: this.debuggerUrlPattern, requestStage: "Response" },
+      { urlPattern: "*://claude.ai/api/organizations/*/conversations/*/completion*", requestStage: "Response" },
+      { urlPattern: "*/api/*/conversations/*/completion*", requestStage: "Response" },
+      { urlPattern: "*completion*", requestStage: "Response" },
+      { urlPattern: "*conversations*", requestStage: "Response" }
     ];
   }
 
@@ -685,12 +783,10 @@ class ClaudeProvider {
     console.log(`[${this.name}] stopStreaming called for ${requestId}`);
     const callback = this.pendingResponseCallbacks.get(requestId);
     if (callback) {
-      const acc = this.requestAccumulators.get(requestId);
-      callback(requestId, (acc ? acc.text : "") + "[STREAM_STOPPED_BY_USER]", true);
-    }
     this.pendingResponseCallbacks.delete(requestId);
     this.requestAccumulators.delete(requestId);
     this._stopDOMMonitoring();
+    }
   }
 
   async _startDOMMonitoring(requestId) {
@@ -701,59 +797,136 @@ class ClaudeProvider {
     let noChangeCount = 0;
     let totalChecks = 0;
     let generationStarted = false; // Track whether we've seen the Stop button appear
-    
+
     // Initial delay to allow Claude to process the send and show generating state
-    await new Promise(resolve => setTimeout(resolve, 2000));
+    await new Promise(resolve => setTimeout(resolve, 500));
 
-    const monitor = () => {
-        const callback = this.pendingResponseCallbacks.get(requestId);
-        if (!callback) {
-            this._stopDOMMonitoring();
-            return;
-        }
+    const monitor = async () => {
+      const callback = this.pendingResponseCallbacks.get(requestId);
+      if (!callback) {
+        this._stopDOMMonitoring();
+        return;
+      }
 
-        totalChecks++;
+      totalChecks++;
 
-        const isGenerating = this._isGenerating();
-        if (isGenerating) generationStarted = true;
+      const isGenerating = this._isGenerating();
+      if (isGenerating) generationStarted = true;
 
-        const result = this._captureResponseDOM();
-        if (result.found) {
-            if (result.text !== lastCapturedText) {
-                lastCapturedText = result.text;
-                noChangeCount = 0;
-                callback(requestId, result.text, false);
-            } else {
-                noChangeCount++;
-            }
-        }
-
-        // Finish conditions:
-        // 1. Generation was seen to start AND stopped, text stable for 2s
-        // 2. Generation never seen (very fast response) — text stable for 4s after monitor start
-        // 3. Text hasn't changed for 10s regardless
-        // 4. Hard timeout
-        const stoppedGenerating = generationStarted && !isGenerating && lastCapturedText.length > 0 && noChangeCount >= 2;
-        const fastResponse = !generationStarted && lastCapturedText.length > 0 && noChangeCount >= 4 && totalChecks >= 6;
-        const noChangeTimeout = lastCapturedText.length > 0 && noChangeCount >= 10;
-        const hardTimeout = totalChecks >= 120;
-        const shouldFinalize = stoppedGenerating || fastResponse || noChangeTimeout || hardTimeout;
-
-        if (shouldFinalize) {
-            const reason = stoppedGenerating ? 'generating_stopped' : fastResponse ? 'fast_response' : noChangeTimeout ? 'no_change_timeout' : 'hard_timeout';
-            console.log(`[${this.name}] DOM monitoring finishing for ${requestId}. Reason: ${reason}. Text len: ${lastCapturedText.length}`);
-            if (lastCapturedText.length > 0) {
-                callback(requestId, lastCapturedText, true);
-            } else {
-                callback(requestId, "[Error: No response captured from DOM]", true);
-            }
-            this.pendingResponseCallbacks.delete(requestId);
-            this._stopDOMMonitoring();
+      const result = this._captureResponseDOM();
+      if (result.found) {
+        if (result.text !== lastCapturedText) {
+          lastCapturedText = result.text;
+          noChangeCount = 0;
+          // DISABLED: No intermediate streaming for DOM capture
+          // callback(requestId, result.text, false);
         } else {
-            this.domMonitorTimer = setTimeout(monitor, 500); // Poll every 500ms
+          noChangeCount++;
         }
+      }
+
+      // Finish conditions:
+      // 1. Generation was seen to start AND stopped, text stable for 500ms (2 checks * 250ms)
+      // 2. Generation never seen (very fast response) — text stable for 1s (4 checks) after monitor start
+      // 3. STABLE-TEXT FALLBACK: Text has remained perfectly stable for 1s (4 checks), indicating completion
+      // 4. Hard timeout
+      const stoppedGenerating = generationStarted && !isGenerating && lastCapturedText.length > 0 && noChangeCount >= 2;
+      const fastResponse = !generationStarted && lastCapturedText.length > 0 && noChangeCount >= 4 && totalChecks >= 6;
+      const stableTextFallback = lastCapturedText.length > 0 && noChangeCount >= 4;
+      const noChangeTimeout = lastCapturedText.length > 0 && noChangeCount >= 10;
+      const hardTimeout = totalChecks >= 240; // Adjusted for 250ms intervals
+      const shouldFinalize = stoppedGenerating || fastResponse || stableTextFallback || noChangeTimeout || hardTimeout;
+
+      if (shouldFinalize) {
+        const reason = stoppedGenerating ? 'generating_stopped' : fastResponse ? 'fast_response' : noChangeTimeout ? 'no_change_timeout' : 'hard_timeout';
+        console.log(`[${this.name}] DOM monitoring finishing for ${requestId}. Reason: ${reason}. Finalizing...`);
+        
+        // OPTIMIZATION: Try to get the perfect version from the Copy button
+        const perfectText = await this._captureFromCopyButton();
+        if (perfectText) {
+            console.log(`[${this.name}] Successfully captured perfect text from clipboard.`);
+            lastCapturedText = perfectText;
+        }
+
+        if (lastCapturedText && lastCapturedText.length > 0) {
+          const cleanedText = this._cleanResponse(lastCapturedText);
+          callback(requestId, cleanedText, true);
+        } else {
+          callback(requestId, "[Empty response captured - possibly an image or widget without text]", true);
+        }
+        this.pendingResponseCallbacks.delete(requestId);
+        this._stopDOMMonitoring();
+      } else {
+        this.domMonitorTimer = setTimeout(monitor, 250); // Poll every 250ms
+      }
     };
     monitor();
+  }
+
+  async _captureFromCopyButton() {
+    console.log(`[${this.name}] Attempting to capture from Copy button via event interception...`);
+    return new Promise(async (resolve) => {
+        let capturedText = null;
+        
+        // Listener to intercept the copy event
+        const onCopy = (e) => {
+            const text = e.clipboardData.getData('text/plain');
+            if (text && text.trim().length > 0) {
+                console.log(`[${this.name}] Successfully intercepted copy event! Text length: ${text.length}`);
+                capturedText = text.trim();
+                
+                // Block the copy from hitting the system clipboard and stop UI popups
+                e.preventDefault();
+                e.stopImmediatePropagation();
+            }
+        };
+
+        try {
+            document.addEventListener('copy', onCopy, true);
+
+            // Find the copy buttons - target the last one
+            const copyButtons = Array.from(document.querySelectorAll('button[data-testid="action-bar-copy"]'));
+            if (copyButtons.length === 0) {
+                console.log(`[${this.name}] No copy buttons found.`);
+                document.removeEventListener('copy', onCopy, true);
+                return resolve(null);
+            }
+
+            const lastButton = copyButtons[copyButtons.length - 1];
+            lastButton.scrollIntoView({ block: 'center' });
+            
+            // Programmatic click
+            lastButton.click();
+            
+            // Wait up to 1.5s for the event (via onCopy OR via Relay Proxy)
+            let waitTime = 0;
+            const checkInterval = 50;
+            const maxWait = 1500;
+            
+            // Clear previous proxy interception
+            this._lastInterceptedClipboardText = null;
+
+            const waitLoop = setInterval(() => {
+                waitTime += checkInterval;
+                const foundText = capturedText || this._lastInterceptedClipboardText;
+                if (foundText || waitTime >= maxWait) {
+                    clearInterval(waitLoop);
+                    document.removeEventListener('copy', onCopy, true);
+                    resolve(foundText || null);
+                }
+            }, checkInterval);
+
+        } catch (err) {
+            console.error(`[${this.name}] Error in copy interception:`, err);
+            document.removeEventListener('copy', onCopy, true);
+            resolve(null);
+        }
+    });
+  }
+
+  // Legacy/Fallback helper (keep for now but copy interception is preferred)
+  async _readClipboard() {
+    return null; // Redirect to null as we now use interception
   }
 
   _stopDOMMonitoring() {
@@ -766,13 +939,13 @@ class ClaudeProvider {
 
 // Robust registration
 (function register() {
-    if (window.providerUtils) {
-        console.log("ClaudeProvider: Registering...");
-        const providerInstance = new ClaudeProvider();
-        window.providerUtils.registerProvider(providerInstance.name, providerInstance.supportedDomains, providerInstance);
-        console.log("ClaudeProvider: Registered successfully.");
-    } else {
-        console.log("ClaudeProvider: Waiting for providerUtils...");
-        setTimeout(register, 500);
-    }
+  if (window.providerUtils) {
+    console.log("ClaudeProvider: Registering...");
+    const providerInstance = new ClaudeProvider();
+    window.providerUtils.registerProvider(providerInstance.name, providerInstance.supportedDomains, providerInstance);
+    console.log("ClaudeProvider: Registered successfully.");
+  } else {
+    console.log("ClaudeProvider: Waiting for providerUtils...");
+    setTimeout(register, 500);
+  }
 })();
